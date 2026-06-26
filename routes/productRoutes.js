@@ -235,4 +235,64 @@ router.post('/void-sale/:id', async (req, res) => {
     }
 });
 
+// 🔍 1. බිල්පත් අංකයෙන් පැරණි බිල සෙවීමේ API එක
+router.get('/invoice/:id', async (req, res) => {
+  try {
+    // ඔයාගේ සැබෑ Sale/Order Model එකේ නම (උදා: Sale) මෙතනට දාන්න
+    const sale = await Sale.findById(req.params.id).populate('customerId'); 
+    
+    if (!sale) {
+      return res.status(404).json({ message: "මෙම බිල්පත් අංකය සොයාගත නොහැක! ❌" });
+    }
+    res.status(200).json(sale);
+  } catch (error) {
+    res.status(500).json({ error: "දත්ත සෙවීමේදී දෝෂයක් ඇති විය!" });
+  }
+});
+
+// 🔄 2. භාණ්ඩ Return කිරීම සහ Stock එක Update කිරීමේ API එක
+router.post('/return-item', async (req, res) => {
+  const { saleId, productId, returnQty, refundAmount } = req.body;
+
+  try {
+    // අදාළ බිල සොයා ගැනීම
+    const sale = await Sale.findById(saleId);
+    if (!sale) return res.status(404).json({ message: "බිල සොයාගත නොහැක!" });
+
+    // බිලේ ඇති අදාළ භාණ්ඩය (Item) සොයා ගැනීම
+    const item = sale.cartItems.find(p => p._id.toString() === productId);
+    if (!item) return res.status(404).json({ message: "මෙම භාණ්ඩය බිල්පතේ නොමැත!" });
+
+    // දැනට මිලදී ගෙන ඇති ප්‍රමාණයට වඩා Return ප්‍රමාණය වැඩිදැයි බැලීම
+    if (returnQty > item.qty) {
+      return res.status(400).json({ message: "මිලදී ගත් ප්‍රමාණයට වඩා Return ප්‍රමාණය වැඩි විය නොහැක!" });
+    }
+
+    // 📉 පියවර A: සැබෑ Product එකේ Stock එක නැවත වැඩි කිරීම
+    // (item.isTemporary නොවන සැබෑ භාණ්ඩ සඳහා පමණක්)
+    if (productId) {
+      await Product.findByIdAndUpdate(productId, {
+        $inc: { stock: returnQty } 
+      });
+    }
+
+    // 📝 පියවර B: පැරණි බිලේ තොරතුරු වෙනස් කිරීම
+    item.qty -= returnQty; // බිලේ ඇති ප්‍රමාණය අඩු කරයි
+    sale.totalAmount -= refundAmount; // බිලේ මුළු එකතුව අඩු කරයි
+    
+    // බිලේ සියලුම භාණ්ඩ වල ප්‍රමාණය 0 වුවහොත් බිල සෘජුවම Void (අවලංගු) කල හැක
+    if (sale.totalAmount <= 0) {
+      sale.status = "Voided";
+    }
+
+    await sale.save();
+
+    res.status(200).json({ message: "භාණ්ඩය සාර්ථකව Return කලා සහ Stock එක අලුත් කලා! ✅🔄" });
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Return ක්‍රියාවලිය අසාර්ථකයි!" });
+  }
+});
+
 module.exports = router;
