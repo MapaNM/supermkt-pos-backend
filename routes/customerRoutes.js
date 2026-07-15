@@ -48,21 +48,29 @@ router.get('/', async (req, res) => {
 
 // 3. පාරිභෝගිකයෙකු දුරකථන අංකයෙන් සෙවීම
 // 🔍 🛠️ UPDATED: SEARCH CUSTOMER BY NAME OR PHONE
+// customerRoutes.js
+function escapeRegex(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 router.get("/search/:query", async (req, res) => {
   try {
     const { query } = req.params;
 
-    const customer = await Customer.findOne({
-      $or: [
-        { name: { $regex: new RegExp("^" + query + "$", "i") } }, // නම ගැලපේ දැයි බලයි
-        { phone: { $regex: new RegExp("^" + query + "$", "i") } } // දුරකථන අංකය ගැලපේ දැයි බලයි
-      ]
-    });
-
-    if (!customer) {
-      return res.status(404).json({ message: "පාරිභෝගිකයෙකු සොයාගත නොහැක!" });
+    if (!query || query.trim().length === 0) {
+      return res.json([]);
     }
-    res.json(customer);
+
+    const safeQuery = escapeRegex(query.trim());
+
+    const customers = await Customer.find({
+      $or: [
+        { name: { $regex: safeQuery, $options: "i" } },
+        { phone: { $regex: safeQuery, $options: "i" } }
+      ]
+    }).limit(10);
+
+    res.json(customers);
   } catch (error) {
     res.status(500).json({ message: "සෙවීම අසාර්ථකයි", error: error.message });
   }
