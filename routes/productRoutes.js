@@ -7,8 +7,7 @@ const Customer = require('../models/Customer');
 // 1. භාණ්ඩයක් ඇතුලත් කිරීම (Discount ද සමඟ)
 router.post("/add", async (req, res) => {
   try {
-    // 🛠️ UPDATED: req.body එකෙන් 'unit' අගයද වෙන් කර ලබා ගනී
-    const { name, price, marketPrice, costPrice, stock, discount, barcode, unit } = req.body;
+    const { name, price, marketPrice, costPrice, stock, discount, barcode, unit, category } = req.body;
 
     const newProduct = new Product({
       name,
@@ -18,7 +17,8 @@ router.post("/add", async (req, res) => {
       stock,
       discount,
       barcode,
-      unit // 🛠️ UPDATED: නව භාණ්ඩය සමඟ Unit එක සේව් කරයි
+      unit,
+      category
     });
 
     await newProduct.save();
