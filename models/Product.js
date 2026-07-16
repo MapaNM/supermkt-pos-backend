@@ -10,7 +10,8 @@ const productSchema = new mongoose.Schema(
     discount: { type: Number, default: 0 },
     barcode: { type: String },
     // 🛠️ UPDATED LINE: Unit එක Database එකේ සේව් කරගැනීමට Schema එකට ඇතුලත් කලා
-    unit: { type: String, default: "Kg" } 
+    unit: { type: String, default: "Kg" },
+    category: { type: String, enum: ["Grocery", "Vegetables", "Fruits", "Beverages", "Dairy", "Bakery", "Cosmetics", "Household", "Other"], default: "Grocery"}
   },
   { timestamps: true }
 );
