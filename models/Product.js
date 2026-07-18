@@ -11,7 +11,9 @@ const productSchema = new mongoose.Schema(
     barcode: { type: String },
     // 🛠️ UPDATED LINE: Unit එක Database එකේ සේව් කරගැනීමට Schema එකට ඇතුලත් කලා
     unit: { type: String, default: "Kg" },
-    category: { type: String, enum: ["Grocery", "Vegetables", "Fruits", "Beverages", "Snacks", "Sweets", "Biscuits", "Dairy", "Bakery", "Cosmetics", "Household", "Other"], default: "Grocery"}
+    category: { type: String, enum: ["Grocery", "Vegetables", "Fruits", "Beverages", "Snacks", "Sweets", "Biscuits", "Dairy", "Bakery", "Cosmetics", "Household", "Other"], default: "Grocery"},
+    minStockLevel: { type: Number, default: 5 },  // Reorder Alert Level
+    preferredSupplierId: { type: mongoose.Schema.Types.ObjectId, ref: "Supplier", default: null },
   },
   { timestamps: true }
 );

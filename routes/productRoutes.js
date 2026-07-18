@@ -7,7 +7,8 @@ const Customer = require('../models/Customer');
 // 1. භාණ්ඩයක් ඇතුලත් කිරීම (Discount ද සමඟ)
 router.post("/add", async (req, res) => {
   try {
-    const { name, price, marketPrice, costPrice, stock, discount, barcode, unit, category } = req.body;
+    // 🛠️ UPDATED (Step 3): req.body එකෙන් 'category', 'minStockLevel', 'preferredSupplierId' ද වෙන් කර ලබා ගනී
+    const { name, price, marketPrice, costPrice, stock, discount, barcode, unit, category, minStockLevel, preferredSupplierId } = req.body;
 
     const newProduct = new Product({
       name,
@@ -18,7 +19,9 @@ router.post("/add", async (req, res) => {
       discount,
       barcode,
       unit,
-      category
+      category,
+      minStockLevel,           // 🛠️ NEW (Step 3): Reorder Alert Level
+      preferredSupplierId: preferredSupplierId || null // 🛠️ NEW (Step 3): Reorder Suggestion සඳහා
     });
 
     await newProduct.save();
@@ -41,7 +44,7 @@ router.get('/', async (req, res) => {
 // 3. භාණ්ඩයක් යාවත්කාලීන කිරීම
 router.put("/update/:id", async (req, res) => {
   try {
-    // 🛠️ UPDATED: req.body එක කෙලින්ම update කිරීමට දීමෙන් unit එකද ඇතුලත්ව සියල්ල update වේ
+    // req.body එක කෙලින්ම update කිරීමට දීමෙන් minStockLevel/preferredSupplierId ඇතුලුව සියල්ල update වේ
     const updatedProduct = await Product.findByIdAndUpdate(
       req.params.id, 
       req.body, 
@@ -54,7 +57,7 @@ router.put("/update/:id", async (req, res) => {
 
     res.json({ message: "යාවත්කාලීන කිරීම සාර්ථකයි! 🔄", product: updatedProduct });
   } catch (error) {
-    res.status(500).json({ message: "යාවत्කාලීන කිරීම අසාර්ථකයි", error: error.message });
+    res.status(500).json({ message: "යාවත්කාලීන කිරීම අසාර්ථකයි", error: error.message });
   }
 });
 
