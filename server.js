@@ -30,11 +30,13 @@ app.get('/', (req, res) => {
 const productRoutes = require('./routes/productRoutes');
 const userRoutes = require('./routes/userRoutes');
 const customerRoutes = require('./routes/customerRoutes'); // (ඉහළ තිබූ පේලිය මෙතැනට නිවැරදිව ඇතුලත් කලා)
+const supplierRoutes = require('./routes/supplierRoutes');
 
 // URL එකක් විදිහට පාවිච්චි කරන්න සම්බන්ධ කිරීම
 app.use('/api/products', productRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/customers', customerRoutes);
+app.use('/api/suppliers', supplierRoutes);
 
 // Server එක Start කිරීම (Render.com එකට ගැළපෙන සේ dynamic කර ඇත)
 const PORT = process.env.PORT || 5008;
