@@ -94,14 +94,27 @@ router.delete("/delete/:id", async (req, res) => {
 // 4. ණය මුදල් පියවීම (Pay/Settle Credit)
 router.post('/pay-credit/:id', async (req, res) => {
     try {
-        const { amount } = req.body; // පියවන මුදල
+        const { amount } = req.body;
+        const paidAmount = Number(amount);
+        if (!paidAmount || paidAmount <= 0) {
+            return res.status(400).json({ message: "නිවැරදි මුදලක් ඇතුලත් කරන්න!" });
+        }
+
         const customer = await Customer.findById(req.params.id);
         if (!customer) return res.status(404).json({ message: "පාරිභෝගිකයා සොයාගත නොහැක" });
 
-        customer.creditBalance -= Number(amount);
+        customer.creditBalance -= paidAmount;
         if (customer.creditBalance < 0) customer.creditBalance = 0;
-        await customer.save();
 
+        // 🆕 ගෙවීම creditHistory (ledger) එකට Negative amount එකක් විදිහට සටහන් කරයි
+        if (!customer.creditHistory) customer.creditHistory = [];
+        customer.creditHistory.push({
+            amount: -paidAmount,
+            date: new Date(),
+            description: "ණය මුදල් ගෙවීමක් සිදු කලා (Payment Received)"
+        });
+
+        await customer.save();
         res.status(200).json({ message: "ණය මුදල සාර්ථකව යාවත්කාලීන කලා! ✅", customer });
     } catch (error) {
         res.status(500).json({ message: "පියවීම අසාර්ථකයි", error });
