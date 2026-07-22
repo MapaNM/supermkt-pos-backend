@@ -14,6 +14,8 @@ const productSchema = new mongoose.Schema(
     category: { type: String, enum: ["Grocery", "Vegetables", "Fruits", "Beverages", "Snacks", "Sweets", "Biscuits", "Dairy", "Bakery", "Cosmetics", "Household", "Other"], default: "Grocery"},
     minStockLevel: { type: Number, default: 5 },  // Reorder Alert Level
     preferredSupplierId: { type: mongoose.Schema.Types.ObjectId, ref: "Supplier", default: null },
+    // 🆕 EXPIRY TRACKING: භාණ්ඩය කල් ඉකුත් වන දිනය (Perishable නොවන items සඳහා හිස්ව තැබිය හැක)
+    expiryDate: { type: Date, default: null },
   },
   { timestamps: true }
 );
