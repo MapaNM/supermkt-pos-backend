@@ -6,6 +6,10 @@ const Customer = require('../models/Customer');
 const Return = require('../models/Return');
 const Counter = require('../models/Counter');
 
+// 🛠️ NEW: JavaScript Floating-Point Precision Errors (0.1 + 0.2 = 0.30000000000000004 වගේ) නිවැරදි කිරීමට
+// Stock එකට Add/Subtract කරන හැම තැනකම මේකෙන් Round කර, Dirty Values (3.5500000000000007 වගේ) DB එකට Save වීම වළක්වයි
+const roundQty = (num) => Math.round((parseFloat(num) || 0) * 1000) / 1000;
+
 // 🆕 PROFESSIONAL SEQUENTIAL INVOICE NUMBER GENERATOR
 async function generateInvoiceNo() {
   const now = new Date();
@@ -29,7 +33,7 @@ router.post("/add", async (req, res) => {
     const parsedPrice = parseFloat(price) || 0;
     const parsedCost = parseFloat(costPrice) || 0;
     const parsedMarket = parseFloat(marketPrice) || parsedPrice;
-    const parsedStock = parseFloat(stock) || 0;
+    const parsedStock = roundQty(stock);
 
     // Batches එවා නැත්නම් default initial batch එකක් සාදයි
     const initialBatches = (batches && Array.isArray(batches) && batches.length > 0)
@@ -165,13 +169,13 @@ router.post('/checkout', async (req, res) => {
         const qtyToReduce = parseFloat(item.qty);
 
         // මුළු Stock එක අඩු කිරීම
-        product.stock = Math.max(0, parseFloat(product.stock) - qtyToReduce);
+        product.stock = Math.max(0, roundQty(parseFloat(product.stock) - qtyToReduce));
 
         // 🏷️ Batch-wise Stock එක අඩු කිරීම
         if (item.batchId && product.batches && product.batches.length > 0) {
           const batchIndex = product.batches.findIndex(b => b.batchId === item.batchId);
           if (batchIndex !== -1) {
-            product.batches[batchIndex].stock = Math.max(0, product.batches[batchIndex].stock - qtyToReduce);
+            product.batches[batchIndex].stock = Math.max(0, roundQty(product.batches[batchIndex].stock - qtyToReduce));
           }
         }
         await product.save();
@@ -292,10 +296,10 @@ router.post('/void-sale/:id', async (req, res) => {
       if (item.productId) {
         const prod = await Product.findById(item.productId);
         if (prod) {
-          prod.stock += notReturnedQty;
+          prod.stock = roundQty(prod.stock + notReturnedQty);
           if (item.batchId && prod.batches && prod.batches.length > 0) {
             const bIdx = prod.batches.findIndex(b => b.batchId === item.batchId);
-            if (bIdx !== -1) prod.batches[bIdx].stock += notReturnedQty;
+            if (bIdx !== -1) prod.batches[bIdx].stock = roundQty(prod.batches[bIdx].stock + notReturnedQty);
           }
           await prod.save();
         }
@@ -375,10 +379,10 @@ router.post('/return', async (req, res) => {
       if (saleItem.productId) {
         const prod = await Product.findById(saleItem.productId);
         if (prod) {
-          prod.stock += returnQty;
+          prod.stock = roundQty(prod.stock + returnQty);
           if (saleItem.batchId && prod.batches && prod.batches.length > 0) {
             const bIdx = prod.batches.findIndex(b => b.batchId === saleItem.batchId);
-            if (bIdx !== -1) prod.batches[bIdx].stock += returnQty;
+            if (bIdx !== -1) prod.batches[bIdx].stock = roundQty(prod.batches[bIdx].stock + returnQty);
           }
           await prod.save();
         }
@@ -464,10 +468,10 @@ router.post('/exchange', async (req, res) => {
       if (saleItem.productId) {
         const prod = await Product.findById(saleItem.productId);
         if (prod) {
-          prod.stock += returnQty;
+          prod.stock = roundQty(prod.stock + returnQty);
           if (saleItem.batchId && prod.batches && prod.batches.length > 0) {
             const bIdx = prod.batches.findIndex(b => b.batchId === saleItem.batchId);
-            if (bIdx !== -1) prod.batches[bIdx].stock += returnQty;
+            if (bIdx !== -1) prod.batches[bIdx].stock = roundQty(prod.batches[bIdx].stock + returnQty);
           }
           await prod.save();
         }
@@ -485,10 +489,10 @@ router.post('/exchange', async (req, res) => {
       const qty = parseFloat(item.qty);
       const product = await Product.findById(item._id);
       if (product) {
-        product.stock -= qty;
+        product.stock = Math.max(0, roundQty(product.stock - qty));
         if (item.batchId && product.batches && product.batches.length > 0) {
           const bIdx = product.batches.findIndex(b => b.batchId === item.batchId);
-          if (bIdx !== -1) product.batches[bIdx].stock = Math.max(0, product.batches[bIdx].stock - qty);
+          if (bIdx !== -1) product.batches[bIdx].stock = Math.max(0, roundQty(product.batches[bIdx].stock - qty));
         }
         await product.save();
       }
