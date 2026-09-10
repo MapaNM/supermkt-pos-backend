@@ -55,7 +55,7 @@ router.post("/add", async (req, res) => {
       stock: parsedStock,
       discount: parseFloat(discount) || 0,
       barcode: barcode || "",
-      unit: unit || "Kg",
+      unit: unit ?? "Kg",
       category: category || "Grocery",
       minStockLevel: parseFloat(minStockLevel) || 5,
       preferredSupplierId: preferredSupplierId || null,
