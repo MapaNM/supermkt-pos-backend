@@ -55,7 +55,7 @@ router.post("/add", async (req, res) => {
       stock: parsedStock,
       discount: parseFloat(discount) || 0,
       barcode: barcode || "",
-      unit: unit ?? "Kg",
+      unit: unit ?? "Kg", // 🛠️ FIX: "" (Unit නැත, intentional) වලට "Kg" force නොවෙන්න - undefined/null වලට විතරක් fallback
       category: category || "Grocery",
       minStockLevel: parseFloat(minStockLevel) || 5,
       preferredSupplierId: preferredSupplierId || null,
@@ -279,6 +279,18 @@ router.get('/sales-summary', async (req, res) => {
     });
   } catch (error) {
     res.status(500).json({ message: "වාර්තා ලබාගැනීම අසාර්ථකයි", error: error.message });
+  }
+});
+
+// 6.5 🆕 SALES HISTORY - CLEAR ALL (Real-world Pro: Type-to-confirm guard on frontend, hard delete on backend)
+// ⚠️ මේකෙන් Sale records ටික permanently delete වේ - Product Stock/Customer Credit වලට effect කරන්නේ නැත
+// (Stock/Credit දැනටමත් සිදුවූ Transaction එකක ප්‍රතිඵලයක් - History log එක Clear කිරීම ඒවා Undo කරන්නේ නැත)
+router.delete('/sales/clear-all', async (req, res) => {
+  try {
+    const result = await Sale.deleteMany({});
+    res.status(200).json({ message: `විකුණුම් ඉතිහාසය සම්පූර්ණයෙන් Clear කලා! 🧹 (${result.deletedCount} Records)`, deletedCount: result.deletedCount });
+  } catch (error) {
+    res.status(500).json({ message: "Clear කිරීම අසාර්ථකයි", error: error.message });
   }
 });
 
@@ -551,6 +563,17 @@ router.get('/returns', async (req, res) => {
     res.status(200).json(returns);
   } catch (error) {
     res.status(500).json({ message: "Return ඉතිහාසය ලබාගැනීම අසාර්ථකයි", error: error.message });
+  }
+});
+
+// 12. 🆕 RETURN/EXCHANGE HISTORY - CLEAR ALL
+// ⚠️ මේකෙන් Return log entries ටික permanently delete වේ - Sale document එකේ තියෙන returnedQty/status වලට effect කරන්නේ නැත
+router.delete('/returns/clear-all', async (req, res) => {
+  try {
+    const result = await Return.deleteMany({});
+    res.status(200).json({ message: `Return/Exchange ඉතිහාසය සම්පූර්ණයෙන් Clear කලා! 🧹 (${result.deletedCount} Records)`, deletedCount: result.deletedCount });
+  } catch (error) {
+    res.status(500).json({ message: "Clear කිරීම අසාර්ථකයි", error: error.message });
   }
 });
 
