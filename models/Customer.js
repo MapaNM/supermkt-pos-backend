@@ -4,6 +4,7 @@ const customerSchema = new mongoose.Schema(
   {
     name: { type: String, required: true },
     phone: { type: String, required: true },
+    isLoyaltyMember: { type: Boolean, default: false },
     creditBalance: { type: Number, default: 0 },
     // 🛠️ UPDATED LINE: ණය ගත් ඉතිහාසය (මුදල සහ දිනය) වෙන වෙනම තබා ගැනීමට Array එකක් එකතු කලා
     creditHistory: [
