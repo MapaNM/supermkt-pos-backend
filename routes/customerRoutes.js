@@ -5,11 +5,12 @@ const Customer = require('../models/Customer');
 // 1. අලුත් පාරිභෝගිකයෙක් ඇතුලත් කිරීම
 router.post('/add', async (req, res) => {
     try {
-        const { name, phone } = req.body;
+        const { name, phone, isLoyaltyMember } = req.body;
         const existing = await Customer.findOne({ phone });
         if (existing) return res.status(400).json({ message: "මෙම දුරකථන අංකය දැනටමත් පද්ධතියේ ඇත! ❌" });
 
-        const newCustomer = new Customer({ name, phone });
+        // 🆕 BILL-LEVEL DISCOUNT: Loyalty Card Holder flag එකත් සේව් කරයි
+        const newCustomer = new Customer({ name, phone, isLoyaltyMember: isLoyaltyMember || false });
         await newCustomer.save();
         res.status(201).json({ message: "පාරිභෝගිකයා සාර්ථකව ඇතුලත් කලා! 👤", customer: newCustomer });
     } catch (error) {
