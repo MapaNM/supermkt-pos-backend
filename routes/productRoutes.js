@@ -1,7 +1,7 @@
 const express = require('express');
 const mongoose = require('mongoose'); // 🔐 needed for session/transaction support
 const router = express.Router();
-const RouteError = require('../utils/routeError');
+const RouteError = require('../utils/RouteError');
 const Product = require('../models/Product');
 const Sale = require('../models/Sale');
 const Customer = require('../models/Customer');
