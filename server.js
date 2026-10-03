@@ -3,12 +3,19 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 require('dotenv').config();
 require('./config/backup'); // Backup සකසන කොඩ් එක Import කරගන්න
+const { protect, requireAdmin } = require('./middleware/auth'); // 🔐 Auth middleware
+
+if (!process.env.JWT_SECRET) {
+  console.error("❌ JWT_SECRET .env එකේ නැත! Server එක නවත්වනවා - මේක නැතුව auth එක වැඩ කරන්නෙ නෑ.");
+  process.exit(1);
+}
 
 const app = express();
 
 // 🛠️ Frontend එක වෙනත් සර්වර් එකක (Vercel) ඇති නිසා මෙයට අවසර දිය යුතුය
+// 🔐 UPDATED: "*" වෙනුවට ඔබේ real frontend URL එකම දෙන්න - credentials:true එක්ක "*" පාවිච්චි කරන්න බැහැ
 app.use(cors({
-    origin: "*", // නැතහොත් ඔබේ Vercel URL එක මෙතනට දෙන්න (e.g., 'https://mypos.vercel.app')
+    origin: process.env.FRONTEND_URL || "https://supermkt-pos-backend.onrender.com/api", // 🔐 .env එකේ FRONTEND_URL දාන්න, e.g. 'https://mypos.vercel.app'
     methods: ["GET", "POST", "PUT", "DELETE"],
     credentials: true
 }));
@@ -34,11 +41,28 @@ const supplierRoutes = require('./routes/supplierRoutes');
 const promotionRoutes = require('./routes/promotionRoutes');
 
 // URL එකක් විදිහට පාවිච්චි කරන්න සම්බන්ධ කිරීම
-app.use('/api/products', productRoutes);
-app.use('/api/users', userRoutes);
-app.use('/api/customers', customerRoutes);
-app.use('/api/suppliers', supplierRoutes);
-app.use('/api/promotions', promotionRoutes);
+// 🔐 UPDATED: /api/users හැර අනිත් සියල්ලටම ලොග් වී සිටීම අනිවාර්යයි (protect).
+//    Admin-only actions (add/update/delete product, void sale, etc.) ඒ ඒ route file එක ඇතුලේම
+//    requireAdmin එකෙන් තව සීමා කර ඇත. Suppliers සම්පූර්ණයෙන්ම Admin-only.
+app.use('/api/products', protect, productRoutes);
+app.use('/api/users', userRoutes); // login is public inside; register requires protect+requireAdmin inside
+app.use('/api/customers', protect, customerRoutes);
+app.use('/api/suppliers', protect, requireAdmin, supplierRoutes); // whole module: admin only
+app.use('/api/promotions', protect, promotionRoutes);
+
+// 🔐 404 - define කරපු route එකකවත් match නොවුනොත්
+app.use((req, res) => {
+  res.status(404).json({ message: "මේ API path එක සොයාගත නොහැක" });
+});
+
+// 🔐 SAFETY NET: Route එකක් ඇතුලේ Claude/code එකක් catch කරන්න අමතක වුනු error එකක්
+// (bad JSON body, unexpected exception, etc.) මෙතනින් catch වෙලා, stack trace එක server
+// log එකේ විතරක් print කරලා, client ට generic message එකක් විතරක් යවයි.
+// (Express 5 es async handler errors automatically forward here)
+app.use((err, req, res, next) => {
+  console.error("Unhandled error:", err);
+  res.status(err.status || 500).json({ message: "අනපේක්ෂිත දෝෂයක් ඇති විය! නැවත උත්සාහ කරන්න." });
+});
 
 // Server එක Start කිරීම (Render.com එකට ගැළපෙන සේ dynamic කර ඇත)
 const PORT = process.env.PORT || 5008;

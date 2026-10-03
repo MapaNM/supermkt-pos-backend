@@ -13,7 +13,10 @@ const supplierSchema = new mongoose.Schema(
     ledger: [
       {
         type: { type: String, enum: ["purchase", "payment"], required: true },
-        amount: { type: Number, required: true },
+        amount: { type: Number, required: true }, // balanceDue එකට ඇත්තටම යෙදුන ගණන (applied amount)
+        // 🆕 Payment එකක් වෙද්දී ඇත්තටම දුන් මුදල සහ ඒකෙන් ඉතුරු (Overpayment) මුදල වෙනම track කරයි
+        paidAmount: { type: Number, default: null },
+        changeGiven: { type: Number, default: 0 },
         description: { type: String },
         // 🛠️ NEW (Step 2 - GRN Multi-item): එකම Invoice/GRN එකකින් ලැබුණු Products කිහිපයම මෙතනින් track වේ
         items: [
