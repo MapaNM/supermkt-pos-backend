@@ -127,6 +127,14 @@ router.post('/pay-credit/:id', async (req, res) => {
             if (!customer) throw new RouteError(404, "පාරිභෝගිකයා සොයාගත නොහැක");
 
             const currentDue = customer.creditBalance || 0;
+
+            // 🆕 FIX: ණයක් නැති customer කෙනෙකුගෙන් "ගෙවීමක්" record කරන්න බෑ - ණය 0ට වඩා
+            // තිබුනොත් විතරයි settle කරන්න ඕන දෙයක් තියෙන්නේ. (කලින් මේක allow වුනා - paidAmount
+            // සම්පූර්ණයෙන්ම "changeGiven" විදිහට ගිහින්, තේරුමක් නැති payment record එකක් ලැජර් එකට වැටුනා.)
+            if (currentDue <= 0) {
+                throw new RouteError(400, "මෙම පාරිභෝගිකයාට ණයක් නැත! ගෙවීමක් අවශ්‍ය නොවේ.");
+            }
+
             // ණයට ඇත්තටම යෙදෙන්නේ, ගෙවපු මුදලෙන් ණයට ඉතිරිව තියෙන ප්‍රමාණය දක්වා විතරයි
             const appliedAmount = Math.round(Math.min(paidAmount, currentDue) * 100) / 100;
             // ඉතුරු (ණයට වඩා ගෙවපු) මුදල - customer ට ආපසු දෙන්න ඕන "change" එක
