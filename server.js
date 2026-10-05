@@ -13,9 +13,25 @@ if (!process.env.JWT_SECRET) {
 const app = express();
 
 // 🛠️ Frontend එක වෙනත් සර්වර් එකක (Vercel) ඇති නිසා මෙයට අවසර දිය යුතුය
-// 🔐 UPDATED: "*" වෙනුවට ඔබේ real frontend URL එකම දෙන්න - credentials:true එක්ක "*" පාවිච්චි කරන්න බැහැ
+// 🔐 UPDATED: FRONTEND_URL එකේ comma-separated origins කිහිපයක් දාන්න පුළුවන් දැන් - production
+// Vercel URL එකත්, local dev (localhost:5173) එකත් දෙකම එකවර allow කරගන්න, "*" කවදාවත් පාවිච්චි කරන්නේ නෑ
+// (credentials:true එක්ක "*" පාවිච්චි කරන්න බැහැ). .env එකේ:
+//   FRONTEND_URL=https://supermkt-pos-frontend.vercel.app,http://localhost:5173
+const allowedOrigins = (process.env.FRONTEND_URL || "http://localhost:5173")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
 app.use(cors({
-    origin: process.env.FRONTEND_URL || "https://supermkt-pos-backend.onrender.com/api", // 🔐 .env එකේ FRONTEND_URL දාන්න, e.g. 'https://mypos.vercel.app'
+    origin: (origin, callback) => {
+      // origin undefined - server-to-server calls, curl, Postman (browser සෑදෙන requests වලට විතරක් origin header එක එන්නේ)
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        console.warn(`CORS blocked: ${origin} not in allowed list [${allowedOrigins.join(", ")}]`);
+        callback(new Error("Not allowed by CORS"));
+      }
+    },
     methods: ["GET", "POST", "PUT", "DELETE"],
     credentials: true
 }));

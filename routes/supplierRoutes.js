@@ -210,6 +210,13 @@ router.post("/pay/:id", async (req, res) => {
       if (!supplier) throw new RouteError(404, "සැපයුම්කරු සොයාගත නොහැක");
 
       const currentDue = supplier.balanceDue || 0;
+
+      // 🆕 FIX: ගෙවීමට ඇති මුදලක් නැති supplier කෙනෙකුට "ගෙවීමක්" record කරන්න බෑ - balanceDue
+      // 0ට වඩා තිබුනොත් විතරයි settle කරන්න ඕන දෙයක් තියෙන්නේ.
+      if (currentDue <= 0) {
+        throw new RouteError(400, "මෙම සැපයුම්කරුට ගෙවීමට ඇති මුදලක් නැත! ගෙවීමක් අවශ්‍ය නොවේ.");
+      }
+
       // balanceDue එකට ඇත්තටම යෙදෙන්නේ, ගෙවපු මුදලෙන් ණයට ඉතිරිව තියෙන ප්‍රමාණය දක්වා විතරයි
       const appliedAmount = Math.round(Math.min(paidAmount, currentDue) * 100) / 100;
       // ඉතුරු (ණයට වඩා ගෙවපු) මුදල - ආපසු ලැබෙන්න ඕන "change" එක
