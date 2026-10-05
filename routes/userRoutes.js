@@ -53,6 +53,45 @@ router.post('/register', protect, requireAdmin, async (req, res) => {
     }
 });
 
+// 1.5 🆕 සියලුම Staff ගිණුම් ලබාගැනීම (Admin Panel එකේ "Cashier Accounts" List එකට)
+// 🔐 Admin-only. Password hash එක කවදාවත් response එකේ නෑ.
+router.get('/', protect, requireAdmin, async (req, res) => {
+    try {
+        const users = await User.find().select('-password').sort({ role: 1, username: 1 });
+        res.status(200).json(users);
+    } catch (error) {
+        res.status(500).json({ message: "දත්ත ලබාගැනීම අසාර්ථකයි" });
+    }
+});
+
+// 1.6 🆕 Staff ගිණුමක් මකා දැමීම
+// 🔐 Admin-only. තමන්ගේම ගිණුම මකා දාගන්න බෑ (accidental lockout වළක්වයි), සහ පද්ධතියේ
+// ඉන්න අන්තිම admin ගිණුමත් මකන්න බෑ (chicken/egg - නැවත admin හදන්න කෙනෙක් නැතුව යනවා).
+router.delete('/:id', protect, requireAdmin, async (req, res) => {
+    try {
+        if (req.params.id === req.user._id.toString()) {
+            return res.status(400).json({ message: "ඔබගේම ගිණුම මකා දැමිය නොහැක!" });
+        }
+
+        const target = await User.findById(req.params.id);
+        if (!target) {
+            return res.status(404).json({ message: "පරිශීලකයා සොයාගත නොහැක" });
+        }
+
+        if (target.role === 'admin') {
+            const adminCount = await User.countDocuments({ role: 'admin' });
+            if (adminCount <= 1) {
+                return res.status(400).json({ message: "පද්ධතියේ ඉන්න එකම Admin ගිණුම මකා දැමිය නොහැක!" });
+            }
+        }
+
+        await User.findByIdAndDelete(req.params.id);
+        res.status(200).json({ message: "ගිණුම සාර්ථකව මකා දැමුවා! 🗑️" });
+    } catch (error) {
+        res.status(500).json({ message: "මකා දැමීම අසාර්ථකයි" });
+    }
+});
+
 // 2. Login API - මෙක විතරයි public route එක
 router.post('/login', loginRateLimiter, async (req, res) => {
     const { username, password } = req.body;
