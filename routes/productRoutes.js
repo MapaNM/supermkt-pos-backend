@@ -385,11 +385,42 @@ router.get('/sales-summary', requireAdmin, async (req, res) => {
     let qrSales = 0;
     let creditSales = 0;
 
+    // 🆕 DASHBOARD: පසුගිය දින 14ක Daily Sales Graph එකට - දවස් 14ම 0 කරලාම pre-seed කරයි,
+    // ඒ දවසට Sale එකක්වත් නැතත් Graph එකේ "gap" එකක් නැතුව, 0 height bar එකක් විදිහටම පෙන්වයි.
+    const DAYS_BACK = 14;
+    const dayKey = (d) => {
+      const dt = new Date(d);
+      return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}-${String(dt.getDate()).padStart(2, "0")}`;
+    };
+    const dailyMap = new Map();
+    const todayForChart = new Date();
+    for (let i = DAYS_BACK - 1; i >= 0; i--) {
+      const d = new Date(todayForChart);
+      d.setDate(d.getDate() - i);
+      dailyMap.set(dayKey(d), { date: dayKey(d), revenue: 0, profit: 0, billCount: 0 });
+    }
+
+    // 🆕 DASHBOARD: Cashier කෙනෙක් කෙනෙක් වෙනම Performance (bills, revenue, profit, avg bill,
+    // void/return count) - Accountability සහ fraud-pattern (නිතර void කරන කෙනෙක්) identify කරගන්න.
+    const cashierMap = new Map();
+    const getCashierStat = (name) => {
+      const key = name || "Unknown";
+      if (!cashierMap.has(key)) {
+        cashierMap.set(key, { cashier: key, billCount: 0, totalRevenue: 0, totalProfit: 0, voidCount: 0, returnCount: 0 });
+      }
+      return cashierMap.get(key);
+    };
+
     sales.forEach(sale => {
+      const cashierStat = getCashierStat(sale.cashier);
+
       // 🛠️ FIX: a Voided sale never actually happened financially — it must NOT
       // count toward revenue/profit/breakdown, even though it still appears in the
       // "sales" list below (the frontend log needs it there for the audit trail).
-      if (sale.status === 'Voided') return;
+      if (sale.status === 'Voided') {
+        cashierStat.voidCount += 1; // 🆕 track per-cashier, even though it's excluded from revenue below
+        return;
+      }
 
       // 🛠️ FIX: for a Returned/PartiallyReturned sale, sale.totalAmount/totalProfit
       // are the ORIGINAL figures from before the refund — using them as-is silently
@@ -400,6 +431,7 @@ router.get('/sales-summary', requireAdmin, async (req, res) => {
       let netProfit = sale.totalProfit;
 
       if (sale.status === 'Returned' || sale.status === 'PartiallyReturned') {
+        cashierStat.returnCount += 1; // 🆕
         netRevenue = 0;
         netProfit = 0;
         for (const item of sale.items) {
@@ -412,17 +444,37 @@ router.get('/sales-summary', requireAdmin, async (req, res) => {
       totalRevenue += netRevenue;
       totalProfit += netProfit;
 
+      cashierStat.billCount += 1;
+      cashierStat.totalRevenue += netRevenue;
+      cashierStat.totalProfit += netProfit;
+
       if (sale.paymentMethod === 'Cash') cashSales += netRevenue;
       else if (sale.paymentMethod === 'Card') cardSales += netRevenue;
       else if (sale.paymentMethod === 'QR') qrSales += netRevenue;
       else if (sale.paymentMethod === 'Credit') creditSales += netRevenue;
+
+      // 🆕 Daily bucket (පසුගිය දින 14ට ඇතුලත් නම් විතරයි - පරණ Sale එකක් උනත් totals වලින් අයින් වෙන්නේ නෑ)
+      const key = dayKey(sale.createdAt);
+      if (dailyMap.has(key)) {
+        const bucket = dailyMap.get(key);
+        bucket.revenue += netRevenue;
+        bucket.profit += netProfit;
+        bucket.billCount += 1;
+      }
     });
+
+    // 🆕 Revenue අනුව වැඩිම විකුණපු cashier මුලින්ම පේන්න sort කරයි
+    const cashierPerformance = Array.from(cashierMap.values())
+      .map(c => ({ ...c, avgBillValue: c.billCount > 0 ? Math.round((c.totalRevenue / c.billCount) * 100) / 100 : 0 }))
+      .sort((a, b) => b.totalRevenue - a.totalRevenue);
 
     res.status(200).json({
       totalSalesCount: sales.filter(s => s.status !== 'Voided').length, // 🛠️ FIX: a voided bill isn't a completed sale
       totalRevenue,
       totalProfit,
       breakdown: { cashSales, cardSales, qrSales, creditSales },
+      dailySales: Array.from(dailyMap.values()), // 🆕 Dashboard graph එකට, දින 14 chronological order එකේ
+      cashierPerformance, // 🆕 Dashboard cashier performance table එකට
       sales // 🆕 unfiltered list still goes to the frontend — the log view needs Voided/Returned rows for its audit trail
     });
   } catch (error) {
