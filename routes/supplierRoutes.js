@@ -4,12 +4,33 @@ const router = express.Router();
 const RouteError = require("../utils/RouteError");
 const Supplier = require("../models/Supplier");
 const Product = require("../models/Product");
+const GRN = require("../models/GRN"); // 🆕 Professional GRN document
+const Counter = require("../models/Counter"); // 🆕 Sequential GRN numbering (same pattern as Invoice No)
 // 🔐 note: this entire router is mounted behind `protect` + `requireAdmin` in server.js —
 // supplier management (purchases, balances, payments) is admin-only, no per-route changes needed here.
 
 // Regex special characters escape කිරීම (Regex Injection වළක්වන්න)
 function escapeRegex(text) {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+const roundQty = (num) => Math.round((parseFloat(num) || 0) * 1000) / 1000;
+const round2 = (num) => Math.round((parseFloat(num) || 0) * 100) / 100;
+
+// 🆕 PROFESSIONAL SEQUENTIAL GRN NUMBER GENERATOR - Invoice No එකේම pattern එක
+// GRN-20260101-0001 වගේ, දවසකට 0001 ඉඳන් restart වෙනවා (Real GRN Document Style)
+async function generateGrnNo(session = null) {
+  const now = new Date();
+  const dateStr = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}`;
+  const counterId = `grn-${dateStr}`;
+
+  const counter = await Counter.findOneAndUpdate(
+    { _id: counterId },
+    { $inc: { seq: 1 } },
+    { upsert: true, new: true, session }
+  );
+
+  return `GRN-${dateStr}-${String(counter.seq).padStart(4, "0")}`;
 }
 
 // 1. අලුත් Supplier කෙනෙක් ඇතුලත් කිරීම
@@ -96,18 +117,24 @@ router.delete("/delete/:id", async (req, res) => {
   }
 });
 
-// 6. 🛠️ UPDATED (Step 2 - GRN Multi-item): Supplier Invoice එකකින් Products කිහිපයක් එකවර ලැබුණු බව සටහන් කිරීම
-// items: [{ productId, quantity, costPrice }, ...] - එකම Supplier Invoice එකකින් ආපු product ගණන කීයක් හෝ පිළිගනී
+// 6. 🆕 PROFESSIONAL GRN REBUILD: Supplier Invoice එකකින් Products කිහිපයක් එකවර ලැබුණු බව සටහන් කිරීම
+// items: [{ productId, orderedQty, receivedQty, costPrice, expiryDate, stockMode }, ...]
+//
+// 🐛 FIX (core bug this rebuild solves): කලින් මෙතන product.stock විතරක් update කලා, batches[] array එක
+// කවදාවත් update කලේ නෑ. Frontend එකේ getTotalStock() batches තියෙනවා නම් batches[].stock එකතුවයි
+// return කරන්නේ product.stock එක බලන්නේම නෑ - ඒ නිසා GRN එකෙන් ලැබුණු stock එක catalog/dashboard/checkout
+// කොහේවත් පේන්නේ නැතුව "අතුරුදහන්" වුනා. දැන් "add" mode එකේදී අලුත් Batch එකක් හදලා, ඒකේම Cost Price
+// සහ Expiry Date එකත් සටහන් කරලා, product.stock එකත් batches[].stock එකත් එකවර atomic විදිහට $inc කරනවා -
+// checkout/void/return routes වල already පාවිච්චි කරන dual-field pattern එකමයි.
 router.post("/record-purchase/:id", async (req, res) => {
-  const { items, description } = req.body;
+  const { items, description, supplierInvoiceRef, receivedBy } = req.body;
 
   if (!Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ message: "අවම වශයෙන් භාණ්ඩයක් හෝ GRN List එකට එකතු කරන්න!" });
   }
 
-  // 🔐 TRANSACTIONS: කලින් comment එකේම කිව්වා "එකක් හරි fail වුනොත් කිසිවක් save වෙන්නේ නැහැ"
-  // කියලා - ඒත් ඇත්තටම code එක එහෙම වැඩ කලේ නෑ! item 3 fail උනොත්, item 1,2 ගේ stock
-  // දැනටමත් save වෙලා ඉවරයි. දැන් session.withTransaction() එකෙන් ඇත්තටම all-or-nothing කරයි.
+  // 🔐 TRANSACTIONS: GRN document එක, Product batches[] update එක, Supplier ledger entry එක -
+  // මේ හැම දේම එකවර සාර්ථක වෙන්න ඕන, එකක් fail උනොත් කිසිවක් save වෙන්නේ නෑ (all-or-nothing).
   const session = await mongoose.startSession();
   let responsePayload = null;
 
@@ -116,16 +143,23 @@ router.post("/record-purchase/:id", async (req, res) => {
       const supplier = await Supplier.findById(req.params.id).session(session);
       if (!supplier) throw new RouteError(404, "සැපයුම්කරු සොයාගත නොහැක");
 
+      const grnNo = await generateGrnNo(session);
+
       let grandTotal = 0;
-      const ledgerItems = [];
+      let overallHasDiscrepancy = false;
+      let anyPartial = false;
+      const ledgerItems = []; // backward-compatible Supplier.ledger items (legacy shape, used by existing ledger modal)
+      const grnItems = []; // full new GRN.items (richer shape)
 
       // සියලුම items validate + process කරයි
-      for (const item of items) {
-        const qty = parseFloat(item.quantity);
+      for (let idx = 0; idx < items.length; idx++) {
+        const item = items[idx];
+        const receivedQty = roundQty(item.receivedQty ?? item.quantity); // 🔐 "quantity" = legacy field name, backward compat
+        const orderedQty = roundQty(item.orderedQty || 0);
         const cost = parseFloat(item.costPrice);
 
-        if (!item.productId || !qty || qty <= 0 || !cost || cost <= 0) {
-          throw new RouteError(400, "සියලුම භාණ්ඩ වල නිවැරදි ප්‍රමාණයක් සහ මිලක් තිබිය යුතුයි!");
+        if (!item.productId || !receivedQty || receivedQty <= 0 || !cost || cost <= 0) {
+          throw new RouteError(400, "සියලුම භාණ්ඩ වල නිවැරදි ලැබුණු ප්‍රමාණයක් සහ මිලක් තිබිය යුතුයි!");
         }
 
         const product = await Product.findById(item.productId).session(session);
@@ -133,35 +167,119 @@ router.post("/record-purchase/:id", async (req, res) => {
           throw new RouteError(404, "එක් භාණ්ඩයක් සොයාගත නොහැක - GRN List එක නැවත පරීක්ෂා කරන්න");
         }
 
-        // 🛠️ stockMode "set" නම් - වත්මන් තොගය මේ ප්‍රමාණයටම සකසයි (Opening/Correction Stock සඳහා)
-        //    stockMode "add" (default) නම් - වත්මන් තොගයට මේ ප්‍රමාණය එකතු කරයි (සාමාන්‍ය GRN සඳහා)
+        const expiryDate = item.expiryDate ? new Date(item.expiryDate) : null;
         const stockMode = item.stockMode === "set" ? "set" : "add";
-        if (stockMode === "set") {
-          product.stock = qty;
-        } else {
-          product.stock = parseFloat(product.stock || 0) + qty;
-        }
-        product.costPrice = cost;
-        await product.save({ session });
 
-        const subtotal = qty * cost;
+        // 🆕 Discrepancy check: Ordered Qty සටහන් කරලා තියෙනවා නම්, Received Qty එකට සමාන නැත්නම් flag කරයි
+        const lineHasDiscrepancy = orderedQty > 0 && orderedQty !== receivedQty;
+        if (lineHasDiscrepancy) {
+          overallHasDiscrepancy = true;
+          if (receivedQty < orderedQty) anyPartial = true;
+        }
+
+        let newBatchId = "";
+
+        if (stockMode === "set") {
+          // 🛠️ "Replace/Set" = Opening Stock හෝ Correction සඳහා පමණි - batches කිහිපයක් තියෙනවා නම්
+          // කුමන batch එක replace කරන්නද කියන අපැහැදිලි බව නිසා, batch 0 හෝ 1ක් ඇති products වලට විතරක් ඉඩ දෙයි.
+          if (Array.isArray(product.batches) && product.batches.length > 1) {
+            throw new RouteError(
+              400,
+              `"${product.name}" භාණ්ඩයට Batch කිහිපයක් දැනටමත් තිබෙන නිසා "Replace" mode පාවිච්චි කරන්න බෑ - Stock Management එකෙන් එක් එක් Batch එක සකසන්න.`
+            );
+          }
+
+          if (Array.isArray(product.batches) && product.batches.length === 1) {
+            product.batches[0].stock = receivedQty;
+            product.batches[0].costPrice = cost;
+            if (expiryDate) product.batches[0].expiryDate = expiryDate;
+            newBatchId = product.batches[0].batchId;
+          }
+          product.stock = receivedQty;
+          product.costPrice = cost;
+          await product.save({ session });
+        } else {
+          // 🆕 "Add" (සාමාන්‍ය GRN) = අලුත් Batch එකක් හදලා, ඒකේම Cost Price + Expiry Date සටහන් කරයි -
+          // පරණ batch එකේ cost price එක සමග මිශ්‍ර නොවී, batch එකින් එක නිවැරදි ලාභ ගණනය සඳහා වෙන්ව තියෙනවා.
+          newBatchId = `${grnNo}-${idx + 1}`;
+          const updated = await Product.findOneAndUpdate(
+            { _id: item.productId },
+            {
+              $inc: { stock: receivedQty },
+              $push: {
+                batches: {
+                  batchId: newBatchId,
+                  label: "",
+                  price: product.price,
+                  costPrice: cost,
+                  marketPrice: product.marketPrice,
+                  discount: 0,
+                  stock: receivedQty,
+                  expiryDate: expiryDate || null,
+                },
+              },
+              $set: { costPrice: cost },
+            },
+            { session, new: true }
+          );
+          if (!updated) {
+            throw new RouteError(404, "එක් භාණ්ඩයක් සොයාගත නොහැක - GRN List එක නැවත පරීක්ෂා කරන්න");
+          }
+        }
+
+        const subtotal = round2(receivedQty * cost);
         grandTotal += subtotal;
 
         ledgerItems.push({
           productName: product.name,
-          quantity: qty,
+          quantity: receivedQty,
           costPrice: cost,
           subtotal,
           stockMode,
         });
+
+        grnItems.push({
+          productId: product._id,
+          productName: product.name,
+          unit: product.unit ?? "Kg",
+          orderedQty,
+          receivedQty,
+          costPrice: cost,
+          subtotal,
+          expiryDate,
+          batchId: newBatchId,
+          stockMode,
+          hasDiscrepancy: lineHasDiscrepancy,
+        });
       }
 
-      // 💰 Grand Total එක Supplier ගේ Balance Due එකට එකතු කර, එකම Ledger Entry එකක් log කරයි
+      grandTotal = round2(grandTotal);
+
+      const status = overallHasDiscrepancy ? (anyPartial ? "Partially Received" : "Discrepancy") : "Received";
+
+      // 📄 GRN Document එක හදයි (Print/PDF + History සඳහා)
+      const newGrn = new GRN({
+        grnNo,
+        supplierId: supplier._id,
+        supplierName: supplier.name,
+        supplierInvoiceRef: supplierInvoiceRef || "",
+        notes: description || "",
+        items: grnItems,
+        grandTotal,
+        status,
+        hasDiscrepancy: overallHasDiscrepancy,
+        receivedBy: receivedBy || "",
+        date: new Date(),
+      });
+      await newGrn.save({ session });
+
+      // 💰 Grand Total එක Supplier ගේ Balance Due එකට එකතු කර, Legacy Ledger Entry එකක්ද තියාගනියි
+      // (Supplier Details Modal එක දැනටමත් මේ shape එකෙන් data පෙන්වන නිසා backward-compat සඳහා)
       supplier.balanceDue += grandTotal;
       supplier.ledger.push({
         type: "purchase",
         amount: grandTotal,
-        description: description || `GRN - භාණ්ඩ ${ledgerItems.length}ක් ලැබුණි`,
+        description: `${grnNo}${supplierInvoiceRef ? ` (Invoice: ${supplierInvoiceRef})` : ""}${description ? ` - ${description}` : ""}`,
         items: ledgerItems,
         date: new Date(),
       });
@@ -169,8 +287,9 @@ router.post("/record-purchase/:id", async (req, res) => {
       await supplier.save({ session });
 
       responsePayload = {
-        message: `Stock ලැබීම සාර්ථකව සටහන් කලා! 📦 (භාණ්ඩ ${ledgerItems.length}ක්, මුළු ගණන: රු.${grandTotal.toFixed(2)})`,
+        message: `GRN ${grnNo} සාර්ථකව සටහන් කලා! 📦 (භාණ්ඩ ${grnItems.length}ක්, මුළු ගණන: රු.${grandTotal.toFixed(2)})`,
         supplier,
+        grn: newGrn,
       };
     });
 
@@ -183,6 +302,53 @@ router.post("/record-purchase/:id", async (req, res) => {
     res.status(500).json({ message: "සටහන් කිරීම අසාර්ථකයි" });
   } finally {
     await session.endSession();
+  }
+});
+
+// 6.5 🆕 GRN List (History) - Filter: supplierId, from, to, q (GRN No / Supplier Name search)
+router.get("/grn/list", async (req, res) => {
+  try {
+    const { supplierId, from, to, q } = req.query;
+    const filter = {};
+
+    if (supplierId) filter.supplierId = supplierId;
+
+    if (from || to) {
+      filter.date = {};
+      if (from) filter.date.$gte = new Date(from);
+      if (to) {
+        const toDate = new Date(to);
+        toDate.setHours(23, 59, 59, 999);
+        filter.date.$lte = toDate;
+      }
+    }
+
+    if (q && q.trim()) {
+      const safeQ = escapeRegex(q.trim());
+      filter.$or = [
+        { grnNo: { $regex: safeQ, $options: "i" } },
+        { supplierName: { $regex: safeQ, $options: "i" } },
+        { supplierInvoiceRef: { $regex: safeQ, $options: "i" } },
+      ];
+    }
+
+    const grns = await GRN.find(filter).sort({ date: -1 }).limit(300);
+    res.status(200).json(grns);
+  } catch (error) {
+    console.error("GRN List ලබාගැනීම අසාර්ථකයි", error);
+    res.status(500).json({ message: "GRN ලැයිස්තුව ලබාගැනීම අසාර්ථකයි" });
+  }
+});
+
+// 6.6 🆕 Single GRN (Print/PDF view සඳහා සම්පූර්ණ විස්තර)
+router.get("/grn/:id", async (req, res) => {
+  try {
+    const grn = await GRN.findById(req.params.id);
+    if (!grn) return res.status(404).json({ message: "GRN එක සොයාගත නොහැක" });
+    res.status(200).json(grn);
+  } catch (error) {
+    console.error("GRN ලබාගැනීම අසාර්ථකයි", error);
+    res.status(500).json({ message: "GRN එක ලබාගැනීම අසාර්ථකයි" });
   }
 });
 
