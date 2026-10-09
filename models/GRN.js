@@ -58,7 +58,8 @@ const grnSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+// 🛠️ grnNo එකේ { unique: true } දැනටමත් index එකක් හදනවා - මෙතන නැවත { grnNo: 1 } index කරන්න ඕන නෑ
+// (ඒක තමයි deploy log එකේ "Duplicate schema index" warning එක පෙන්නුවේ - harmless, ඒත් clean කරමු)
 grnSchema.index({ supplierId: 1, date: -1 });
-grnSchema.index({ grnNo: 1 });
 
 module.exports = mongoose.model("GRN", grnSchema);
