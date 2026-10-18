@@ -90,11 +90,35 @@ router.get('/', async (req, res) => {
 });
 
 // 3. භාණ්ඩයක් යාවත්කාලීන කිරීම
+// 🔐 SECURITY FIX: කලින් req.body එකම whole එකක් විදිහට DB update එකට දැම්මා (Mass-Assignment
+// Vulnerability) - Edit Form එකෙන් එවන නැති extra field එකක්වත් request body එකට එකතු කරලා
+// එව්වොත් ඒකත් update වෙනවා. දැන් Edit Product Form එකෙන් ඇත්තටම එවන fields විතරක් allow-list
+// කරලා, ඒවා විතරක් DB එකට යවනවා.
 router.put("/update/:id", requireAdmin, async (req, res) => {
   try {
+    const {
+      name, marketPrice, price, costPrice, stock, discount, barcode,
+      unit, category, minStockLevel, preferredSupplierId, expiryDate, batches,
+    } = req.body;
+
+    const updateFields = {};
+    if (name !== undefined) updateFields.name = name;
+    if (marketPrice !== undefined) updateFields.marketPrice = marketPrice;
+    if (price !== undefined) updateFields.price = price;
+    if (costPrice !== undefined) updateFields.costPrice = costPrice;
+    if (stock !== undefined) updateFields.stock = stock;
+    if (discount !== undefined) updateFields.discount = discount;
+    if (barcode !== undefined) updateFields.barcode = barcode;
+    if (unit !== undefined) updateFields.unit = unit;
+    if (category !== undefined) updateFields.category = category;
+    if (minStockLevel !== undefined) updateFields.minStockLevel = minStockLevel;
+    if (preferredSupplierId !== undefined) updateFields.preferredSupplierId = preferredSupplierId;
+    if (expiryDate !== undefined) updateFields.expiryDate = expiryDate;
+    if (batches !== undefined) updateFields.batches = batches;
+
     const updatedProduct = await Product.findByIdAndUpdate(
-      req.params.id, 
-      req.body, 
+      req.params.id,
+      updateFields,
       { returnDocument: 'after', runValidators: true }
     );
 
@@ -155,7 +179,7 @@ router.get('/expiring', requireAdmin, async (req, res) => {
 const PRICE_TOLERANCE = 0.01; // floating-point rounding allowance, රු.1 cent ට අඩු වෙනස්කම් විතරයි
 
 router.post('/checkout', async (req, res) => {
-  const { cartItems, cashierName, paymentMethod, customerId, cashReceived, balanceAmount, amountPaid } = req.body;
+  const { cartItems, cashierName, paymentMethod, customerId, cashReceived, balanceAmount, amountPaid, billDiscountSource, billDiscountPercent: clientBillDiscountPercent } = req.body;
 
   if (!Array.isArray(cartItems) || cartItems.length === 0) {
     return res.status(400).json({ message: "බිල හිස්ව පවතී!" });
@@ -226,12 +250,22 @@ router.post('/checkout', async (req, res) => {
         resolvedItems.push({ item, qty, product, batch, canonical });
       }
 
-      // 🔐 Bill-level (Occasion) Promotion එකේ % එකත් client එක විශ්වාස කරන්නේ නෑ - DB එකේ
-      // මේ වෙලාවේ ඇත්තටම active promotion එකක් තියෙනවද බලලා, එකේම % එකම පාවිච්චි කරයි.
+      // 🐛 FIX: කලින් server එක active Occasion promo එකක් තිබුණොත් cashier "Apply" කලේ නැතත්
+      // ස්වයංක්‍රීයව % එක අඩු කළා - ඒ නිසා Receipt/cash එකතු කරපු මුදලයි (වට්ටමක් නැතුව) Sales Report
+      // එකේ මුදලයි (වට්ටම් සහිතව) වෙනස් උනා (උදා: 1650 vs 1485 = හරියටම 10%). දැන් cashier ඇත්තටම
+      // Apply කලොත් (billDiscountSource === "occasion") විතරයි වට්ටම යෙදෙන්නේ. % එක client එකෙන්
+      // විශ්වාස කරන්නේ නෑ - DB එකේ active promo එකේ % එකම පාවිච්චි කරයි, ඒත් client පෙන්නපු % එකත්
+      // DB එකත් ගැලපෙන්නේ නැත්නම් (promo එක මැදදී වෙනස් වෙලා) bill එක reject කරයි.
       let billDiscountPercent = 0;
       let billDiscountName = null;
-      const activePromo = await Promotion.findOne({ type: "occasion", isActive: true }).session(session);
-      if (activePromo) {
+      if (billDiscountSource === "occasion") {
+        const activePromo = await Promotion.findOne({ type: "occasion", isActive: true }).session(session);
+        if (!activePromo) {
+          throw new RouteError(409, "Bill Discount Promotion එක දැන් Active නැත! Cart එක Refresh කරලා නැවත උත්සාහ කරන්න.");
+        }
+        if (Math.abs((parseFloat(clientBillDiscountPercent) || 0) - (activePromo.discountPercent || 0)) > 0.001) {
+          throw new RouteError(409, "Bill Discount % එක වෙනස් වී ඇත! Cart එක Refresh කරලා නැවත උත්සාහ කරන්න.");
+        }
         billDiscountPercent = activePromo.discountPercent || 0;
         billDiscountName = activePromo.name;
       }
@@ -251,7 +285,7 @@ router.post('/checkout', async (req, res) => {
         if (!product) {
           // Manual typed item - කලින් හැටියටම client එකේ price එකම පාවිච්චි කරයි
           const tempOriginalP = parseFloat(item.price);
-          totalAmount += tempOriginalP * qty;
+          totalAmount += Math.round(tempOriginalP * qty * 100) / 100;
           totalProfit += (tempOriginalP * 0.15) * qty;
           saleItems.push({
             productId: null,
@@ -284,7 +318,7 @@ router.post('/checkout', async (req, res) => {
         }
 
         const finalPriceAfterDiscount = canonical.price - canonical.discountAmount;
-        const itemTotal = finalPriceAfterDiscount * qty;
+        const itemTotal = Math.round(finalPriceAfterDiscount * qty * 100) / 100; // 🛠️ line total cents 2කට (client එකත් මේකමයි)
         const itemCost = canonical.costPrice * qty;
         const itemProfit = itemTotal - itemCost;
         const itemSavings = ((canonical.marketPrice || canonical.price) - finalPriceAfterDiscount) * qty;
@@ -308,8 +342,9 @@ router.post('/checkout', async (req, res) => {
       // 🐛 BUG FIX: කලින් මේ Bill-level Occasion Discount එක (billDiscountPercent) backend එකේ
       // කිසි තැනකදී totalAmount එකෙන් අඩු වුනේම නෑ - Receipt එකේ විතරක් පෙන්නුවා, ඇත්තටම
       // ගණන් හදලා තිබුනේ Full Price එකටම! දැන් server-verified % එකෙන් actual total එකෙන් අඩු කරයි.
+      totalAmount = Math.round(totalAmount * 100) / 100;
       const billDiscountAmount = Math.round(((totalAmount * billDiscountPercent) / 100) * 100) / 100;
-      totalAmount = Math.max(0, totalAmount - billDiscountAmount);
+      totalAmount = Math.max(0, Math.round((totalAmount - billDiscountAmount) * 100) / 100);
       totalCustomerSavings += billDiscountAmount;
 
       const paid = parseFloat(amountPaid);
@@ -385,42 +420,35 @@ router.get('/sales-summary', requireAdmin, async (req, res) => {
     let qrSales = 0;
     let creditSales = 0;
 
-    // 🆕 DASHBOARD: පසුගිය දින 14ක Daily Sales Graph එකට - දවස් 14ම 0 කරලාම pre-seed කරයි,
-    // ඒ දවසට Sale එකක්වත් නැතත් Graph එකේ "gap" එකක් නැතුව, 0 height bar එකක් විදිහටම පෙන්වයි.
-    const DAYS_BACK = 14;
-    const dayKey = (d) => {
-      const dt = new Date(d);
-      return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}-${String(dt.getDate()).padStart(2, "0")}`;
+    // 🆕 DASHBOARD: පසුගිය දින 14 (අද ඇතුලත්, පරණ -> අලුත් අනුපිළිවෙලින්) දිනපතා Revenue/Profit/Bills
+    // සහ Cashier අනුව Performance. Voided බිල් Revenue එකට නොගන්නවා (voidCount එකට විතරක් ගනී),
+    // Returned/PartiallyReturned බිල් වල NET (ආපසු දුන්න ප්‍රමාණය අඩු කරපු) අගයම ගනී.
+    const ymd = (d) => {
+      const x = new Date(d);
+      return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, '0')}-${String(x.getDate()).padStart(2, '0')}`;
     };
-    const dailyMap = new Map();
-    const todayForChart = new Date();
-    for (let i = DAYS_BACK - 1; i >= 0; i--) {
-      const d = new Date(todayForChart);
+    const dailyMap = {};
+    const dailySales = [];
+    for (let i = 13; i >= 0; i--) {
+      const d = new Date();
+      d.setHours(0, 0, 0, 0);
       d.setDate(d.getDate() - i);
-      dailyMap.set(dayKey(d), { date: dayKey(d), revenue: 0, profit: 0, billCount: 0 });
+      const key = ymd(d);
+      dailyMap[key] = { date: key, revenue: 0, profit: 0, billCount: 0 };
+      dailySales.push(dailyMap[key]);
     }
-
-    // 🆕 DASHBOARD: Cashier කෙනෙක් කෙනෙක් වෙනම Performance (bills, revenue, profit, avg bill,
-    // void/return count) - Accountability සහ fraud-pattern (නිතර void කරන කෙනෙක්) identify කරගන්න.
-    const cashierMap = new Map();
-    const getCashierStat = (name) => {
-      const key = name || "Unknown";
-      if (!cashierMap.has(key)) {
-        cashierMap.set(key, { cashier: key, billCount: 0, totalRevenue: 0, totalProfit: 0, voidCount: 0, returnCount: 0 });
-      }
-      return cashierMap.get(key);
+    const cashierMap = {};
+    const getCashier = (name) => {
+      const key = name || 'Unknown';
+      if (!cashierMap[key]) cashierMap[key] = { cashier: key, billCount: 0, totalRevenue: 0, avgBillValue: 0, voidCount: 0, returnCount: 0 };
+      return cashierMap[key];
     };
 
     sales.forEach(sale => {
-      const cashierStat = getCashierStat(sale.cashier);
-
       // 🛠️ FIX: a Voided sale never actually happened financially — it must NOT
       // count toward revenue/profit/breakdown, even though it still appears in the
       // "sales" list below (the frontend log needs it there for the audit trail).
-      if (sale.status === 'Voided') {
-        cashierStat.voidCount += 1; // 🆕 track per-cashier, even though it's excluded from revenue below
-        return;
-      }
+      if (sale.status === 'Voided') { getCashier(sale.cashier).voidCount += 1; return; }
 
       // 🛠️ FIX: for a Returned/PartiallyReturned sale, sale.totalAmount/totalProfit
       // are the ORIGINAL figures from before the refund — using them as-is silently
@@ -431,7 +459,6 @@ router.get('/sales-summary', requireAdmin, async (req, res) => {
       let netProfit = sale.totalProfit;
 
       if (sale.status === 'Returned' || sale.status === 'PartiallyReturned') {
-        cashierStat.returnCount += 1; // 🆕
         netRevenue = 0;
         netProfit = 0;
         for (const item of sale.items) {
@@ -444,37 +471,32 @@ router.get('/sales-summary', requireAdmin, async (req, res) => {
       totalRevenue += netRevenue;
       totalProfit += netProfit;
 
-      cashierStat.billCount += 1;
-      cashierStat.totalRevenue += netRevenue;
-      cashierStat.totalProfit += netProfit;
+      const dayStat = dailyMap[ymd(sale.createdAt)];
+      if (dayStat) { dayStat.revenue += netRevenue; dayStat.profit += netProfit; dayStat.billCount += 1; }
+      const cp = getCashier(sale.cashier);
+      cp.billCount += 1;
+      cp.totalRevenue += netRevenue;
+      if (sale.status === 'Returned' || sale.status === 'PartiallyReturned') cp.returnCount += 1;
 
       if (sale.paymentMethod === 'Cash') cashSales += netRevenue;
       else if (sale.paymentMethod === 'Card') cardSales += netRevenue;
       else if (sale.paymentMethod === 'QR') qrSales += netRevenue;
       else if (sale.paymentMethod === 'Credit') creditSales += netRevenue;
-
-      // 🆕 Daily bucket (පසුගිය දින 14ට ඇතුලත් නම් විතරයි - පරණ Sale එකක් උනත් totals වලින් අයින් වෙන්නේ නෑ)
-      const key = dayKey(sale.createdAt);
-      if (dailyMap.has(key)) {
-        const bucket = dailyMap.get(key);
-        bucket.revenue += netRevenue;
-        bucket.profit += netProfit;
-        bucket.billCount += 1;
-      }
     });
 
-    // 🆕 Revenue අනුව වැඩිම විකුණපු cashier මුලින්ම පේන්න sort කරයි
-    const cashierPerformance = Array.from(cashierMap.values())
-      .map(c => ({ ...c, avgBillValue: c.billCount > 0 ? Math.round((c.totalRevenue / c.billCount) * 100) / 100 : 0 }))
+    const round2 = (n) => Math.round(n * 100) / 100;
+    dailySales.forEach(d => { d.revenue = round2(d.revenue); d.profit = round2(d.profit); });
+    const cashierPerformance = Object.values(cashierMap)
+      .map(c => ({ ...c, totalRevenue: round2(c.totalRevenue), avgBillValue: c.billCount > 0 ? round2(c.totalRevenue / c.billCount) : 0 }))
       .sort((a, b) => b.totalRevenue - a.totalRevenue);
 
     res.status(200).json({
+      dailySales,
+      cashierPerformance,
       totalSalesCount: sales.filter(s => s.status !== 'Voided').length, // 🛠️ FIX: a voided bill isn't a completed sale
       totalRevenue,
       totalProfit,
       breakdown: { cashSales, cardSales, qrSales, creditSales },
-      dailySales: Array.from(dailyMap.values()), // 🆕 Dashboard graph එකට, දින 14 chronological order එකේ
-      cashierPerformance, // 🆕 Dashboard cashier performance table එකට
       sales // 🆕 unfiltered list still goes to the frontend — the log view needs Voided/Returned rows for its audit trail
     });
   } catch (error) {
@@ -633,6 +655,29 @@ router.post('/return', async (req, res) => {
 
       if (totalRefundAmount <= 0) throw new RouteError(400, "වලංගු Return ප්‍රමාණයක් හමු නොවුනි!");
 
+      // 🆕 CREDIT බිලක් Cash/Card වලින් Refund කරද්දී, පාරිභෝගිකයා ඇත්තටම ගෙවපු කොටසට (amountPaid) වඩා
+      // වැඩියෙන් Cash/Card ආපසු දෙන්න බෑ - ණයට ගත්ත කොටසට අදාල Refund එක "ණය පොතෙන් අඩු කිරීම"
+      // (CreditAdjust) වලින් විතරයි කරන්න ඕන, නැත්නම් drawer එකෙන් ඇත්තටම නොලැබුණු මුදලක් ආපසු දෙනවා.
+      // කලින් මේ බිලට Cash/Card Refund කරපු මුදල Return records වලින්ම අරගෙන ඉතිරි ප්‍රමාණය බලයි.
+      if (sale.paymentMethod === 'Credit' && (refundMethod === 'Cash' || refundMethod === 'Card' || !refundMethod)) {
+        const priorCashAgg = await Return.aggregate([
+          { $match: { saleId: sale._id, refundMethod: { $in: ['Cash', 'Card'] } } },
+          { $group: { _id: null, total: { $sum: '$totalRefundAmount' } } },
+        ]).session(session);
+        const priorCashRefunded = priorCashAgg[0]?.total || 0;
+        const maxCashRefund = Math.max(0, Math.round(((sale.amountPaid || 0) - priorCashRefunded) * 100) / 100);
+        if (totalRefundAmount > maxCashRefund + 0.004) {
+          throw new RouteError(
+            400,
+            `මෙම ණය බිලේ Cash/Card වලින් Refund කළ හැක්කේ උපරිම රු.${maxCashRefund.toFixed(2)} ක් පමණි (පාරිභෝගිකයා ගෙවූ කොටස). ඉතිරි මුදල "ණය පොතෙන් අඩු කිරීම" ලෙස Refund කරන්න.`
+          );
+        }
+      }
+
+      // 🛠️ FIX: කලින් Credit බිලක් Cash වලින් Refund කළත් sale.amountDue අඩු වුනා, ඒත් Customer ගේ
+      // creditBalance අඩු වුනේ නෑ (බිල පෙන්නපු ණයයි ණය පොතයි ගැලපුනේ නෑ). දැන් amountDue අඩු වෙන්නේ
+      // ණය පොතෙනුත් ඇත්තටම අඩු කරද්දී (CreditAdjust/StoreCredit) විතරයි - දෙකම හැමවෙලේම එකට වෙනස් වේ.
+      let creditAdjusted = false;
       if ((refundMethod === 'StoreCredit' || refundMethod === 'CreditAdjust') && sale.customerId) {
         const customer = await Customer.findById(sale.customerId).session(session);
         if (customer) {
@@ -643,10 +688,11 @@ router.post('/return', async (req, res) => {
             description: `Return/Refund (Bill #${sale.invoiceNo || sale._id.toString().slice(-6)})`
           });
           await customer.save({ session });
+          creditAdjusted = true;
         }
       }
 
-      if (sale.paymentMethod === 'Credit') {
+      if (sale.paymentMethod === 'Credit' && creditAdjusted) {
         sale.amountDue = Math.max(0, (sale.amountDue || 0) - totalRefundAmount);
       }
 

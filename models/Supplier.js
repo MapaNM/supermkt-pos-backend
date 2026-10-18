@@ -17,6 +17,10 @@ const supplierSchema = new mongoose.Schema(
         // 🆕 Payment එකක් වෙද්දී ඇත්තටම දුන් මුදල සහ ඒකෙන් ඉතුරු (Overpayment) මුදල වෙනම track කරයි
         paidAmount: { type: Number, default: null },
         changeGiven: { type: Number, default: 0 },
+        // 🆕 SHIFT RECONCILIATION: මේ ගෙවීම කලේ කව්ද + මොන ක්‍රමයෙන්ද (Cash/Card/Bank) කියලා සටහන් කරයි -
+        // "Cash" ගෙවීම් (type: "payment") විතරයි Shift Close කරන වෙලාවේ Cash Drawer ගණනයෙන් අඩු වෙන්නේ.
+        cashier: { type: String, default: "" },
+        paymentMethod: { type: String, enum: ["Cash", "Card", "Bank Transfer", "Other"], default: "Cash" },
         description: { type: String },
         // 🛠️ NEW (Step 2 - GRN Multi-item): එකම Invoice/GRN එකකින් ලැබුණු Products කිහිපයම මෙතනින් track වේ
         items: [
