@@ -85,9 +85,20 @@ router.get("/search/:query", async (req, res) => {
 });
 
 // 4. Supplier විස්තර යාවත්කාලීන කිරීම
+// 🔐 SECURITY FIX: කලින් req.body එකම whole එකක් විදිහට DB update එකට දැම්මා (Mass-Assignment Vulnerability) -
+// Edit Form එකෙන් name/phone/address විතරක් එවුවත්, request body එකට extra field එකක් (උදා:
+// balanceDue, ledger) එකතු කරලා එව්වොත් ඒකත් update වෙනවා - ගිණුම් වාර්තා (financial records)
+// direct API call එකකින් silently overwrite වෙන්න පුළුවන් කියන එක. දැන් Edit Form එකෙන් ඇත්තටම
+// එවන fields (name, phone, address) විතරක් allow-list කරලා, ඒවා විතරක් DB එකට යවනවා.
 router.put("/update/:id", async (req, res) => {
   try {
-    const updatedSupplier = await Supplier.findByIdAndUpdate(req.params.id, req.body, {
+    const { name, phone, address } = req.body;
+    const updateFields = {};
+    if (name !== undefined) updateFields.name = name;
+    if (phone !== undefined) updateFields.phone = phone;
+    if (address !== undefined) updateFields.address = address;
+
+    const updatedSupplier = await Supplier.findByIdAndUpdate(req.params.id, updateFields, {
       returnDocument: "after",
       runValidators: true,
     });
@@ -357,9 +368,13 @@ router.get("/grn/:id", async (req, res) => {
 // චෙක් එකක්) ගෙව්වොත්, balanceDue 0ට clamp කලත්, ledger එකේ සම්පූර්ණ ගණනම "payment" විදිහට
 // සටහන් වුනා - ඇත්තටම ගෙවන්න ඕන ප්‍රමාණයට වඩා වැඩි ගණන (ආපසු ලැබෙන්න ඕන "change" එක) ගැන record
 // එකක්ම තිබුණේ නෑ.
+// 🆕 SHIFT RECONCILIATION: Payment Method (Cash/Card/Bank Transfer/Other) සහ මේ ගෙවීම කරපු Admin
+// කව්ද කියලා දැන් සටහන් කරයි - "Cash" ගෙවීම් විතරයි Shift Close එකේ Cash Drawer ගණනයෙන් අඩු වෙන්නේ.
 router.post("/pay/:id", async (req, res) => {
-  const { amount } = req.body;
+  const { amount, paymentMethod } = req.body;
   const paidAmount = Number(amount);
+  const validMethods = ["Cash", "Card", "Bank Transfer", "Other"];
+  const method = validMethods.includes(paymentMethod) ? paymentMethod : "Cash";
 
   if (!paidAmount || paidAmount <= 0) {
     return res.status(400).json({ message: "නිවැරදි මුදලක් ඇතුලත් කරන්න!" });
@@ -395,9 +410,11 @@ router.post("/pay/:id", async (req, res) => {
         amount: appliedAmount,
         paidAmount,
         changeGiven,
+        cashier: req.user.username,
+        paymentMethod: method,
         description: changeGiven > 0
-          ? `ගෙවීමක් සිදු කිරීම (ගෙවූ මුදල: රු.${paidAmount.toFixed(2)}, ණයට යෙදුවේ: රු.${appliedAmount.toFixed(2)}, ආපසු ලැබුණු මුදල: රු.${changeGiven.toFixed(2)})`
-          : "ගෙවීමක් සිදු කිරීම",
+          ? `ගෙවීමක් සිදු කිරීම (ගෙවූ මුදල: රු.${paidAmount.toFixed(2)}, ණයට යෙදුවේ: රු.${appliedAmount.toFixed(2)}, ආපසු ලැබුණු මුදල: රු.${changeGiven.toFixed(2)}) - ${method}`
+          : `ගෙවීමක් සිදු කිරීම - ${method}`,
         date: new Date(),
       });
 

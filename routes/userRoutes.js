@@ -24,7 +24,7 @@ function loginRateLimiter(req, res, next) {
     }
     entry.count += 1;
     if (entry.count > LOGIN_MAX_ATTEMPTS) {
-        return res.status(429).json({ message: "බොහෝ වාරයක් වැරදි උත්සාහයන්! විනාඩි 15කින් නැවත උත්සාහ කරන්න." });
+        return res.status(429).json({ message: "Too Many wrong enties! Try Again in 15min.." });
     }
     next();
 }
@@ -37,6 +37,14 @@ router.post('/register', protect, requireAdmin, async (req, res) => {
     try {
         if (!username || !password) {
             return res.status(400).json({ message: "Username සහ Password දෙකම අවශ්‍යයි!" });
+        }
+        // 🔐 SECURITY FIX: කලින් මේ route එකේ password strength check එකක්ම තිබුනේ නෑ - admin කෙනෙක්ට
+        // "1" වගේ password එකකින්වත් Cashier ගිණුමක් හදන්න පුළුවන් උනා. scripts/createAdmin.js
+        // (first admin account එක හදන CLI script එක) character 8ක අවම සීමාවක් දැනටමත් enforce කරනවා -
+        // දැන් මේ route එකටත් එම රීතියම දානවා, Frontend validation එක bypass කරලාවත් weak password
+        // එකක් register කරන්න බැරි වෙන්න.
+        if (password.length < 8) {
+            return res.status(400).json({ message: "Password must be At least 8 characters" });
         }
         const newUser = new User({ username, password, role });
         await newUser.save();
@@ -97,7 +105,7 @@ router.post('/login', loginRateLimiter, async (req, res) => {
     const { username, password } = req.body;
     try {
         if (!username || !password) {
-            return res.status(400).json({ success: false, message: "Username සහ Password දෙකම ඇතුලත් කරන්න!" });
+            return res.status(400).json({ success: false, message: "Enter Both Username & Password !" });
         }
 
         const user = await User.findOne({ username });
@@ -114,10 +122,10 @@ router.post('/login', loginRateLimiter, async (req, res) => {
                 user: { username: user.username, role: user.role }
             });
         } else {
-            res.status(401).json({ success: false, message: "Username හෝ Password වැරදියි! ❌" });
+            res.status(401).json({ success: false, message: "Username or Password Invalid! ❌" });
         }
     } catch (error) {
-        res.status(500).json({ message: "සර්වර් දෝෂයක්" });
+        res.status(500).json({ message: "Server Error" });
     }
 });
 

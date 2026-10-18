@@ -31,9 +31,20 @@ router.post("/add", requireAdmin, async (req, res) => {
 });
 
 // 3. Promotion එකක් Update කිරීම
+// 🔐 SECURITY FIX: කලින් req.body එකම whole එකක් විදිහට DB update එකට දැම්මා (Mass-Assignment
+// Vulnerability) - extra field එකක් (උදා: isActive) request body එකට එකතු කරලා, "Activate/Deactivate"
+// routes දෙක bypass කරලා, එකවර type එකකම Promotion කිහිපයක් active කරගන්න පුළුවන් උනා. දැන් මේ
+// Form එකෙන් ඇත්තටම එවන fields (name, discountPercent, type) විතරක් allow-list කරලා, isActive
+// පාලනය වෙන්නේ /activate සහ /deactivate routes දෙකෙන් විතරයි.
 router.put("/update/:id", requireAdmin, async (req, res) => {
   try {
-    const updated = await Promotion.findByIdAndUpdate(req.params.id, req.body, { returnDocument: "after", runValidators: true });
+    const { name, discountPercent, type } = req.body;
+    const updateFields = {};
+    if (name !== undefined) updateFields.name = name;
+    if (discountPercent !== undefined) updateFields.discountPercent = discountPercent;
+    if (type !== undefined) updateFields.type = type;
+
+    const updated = await Promotion.findByIdAndUpdate(req.params.id, updateFields, { returnDocument: "after", runValidators: true });
     if (!updated) return res.status(404).json({ message: "Promotion එක සොයාගත නොහැක" });
     res.json({ message: "යාවත්කාලීන කිරීම සාර්ථකයි! 🔄", promotion: updated });
   } catch (error) {
