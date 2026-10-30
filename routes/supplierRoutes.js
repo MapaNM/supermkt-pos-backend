@@ -1,7 +1,7 @@
 const express = require("express");
 const mongoose = require("mongoose"); // 🔐 needed for session/transaction support
 const router = express.Router();
-const RouteError = require("../utils/routeError");
+const RouteError = require("../utils/RouteError");
 const Supplier = require("../models/Supplier");
 const Product = require("../models/Product");
 const { requireOpenShift } = require("../middleware/requireShift"); // 🔐 Make Shift mandatory (for Cash payments)

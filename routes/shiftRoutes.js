@@ -1,6 +1,6 @@
 const express = require("express");
 const router = express.Router();
-const RouteError = require("../utils/routeError");
+const RouteError = require("../utils/RouteError");
 const Shift = require("../models/Shift");
 const Sale = require("../models/Sale");
 const Return = require("../models/Return");
