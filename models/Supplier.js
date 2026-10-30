@@ -6,30 +6,30 @@ const supplierSchema = new mongoose.Schema(
     phone: { type: String, required: true },
     address: { type: String },
 
-    // 🛠️ අපි (Shop එක) Supplier ට ගෙවන්න ඕන මුළු මුදල (Accounts Payable)
+    // 🛠️ The total amount we (the Shop) must pay the Supplier (Accounts Payable)
     balanceDue: { type: Number, default: 0 },
 
-    // 🛠️ Purchase (stock ලැබීම) සහ Payment (ගෙවීම) දෙකම එකම ලෙජරයක සටහන් වේ
+    // 🛠️ Both Purchases (stock received) and Payments are recorded in the same ledger
     ledger: [
       {
         type: { type: String, enum: ["purchase", "payment"], required: true },
-        amount: { type: Number, required: true }, // balanceDue එකට ඇත්තටම යෙදුන ගණන (applied amount)
-        // 🆕 Payment එකක් වෙද්දී ඇත්තටම දුන් මුදල සහ ඒකෙන් ඉතුරු (Overpayment) මුදල වෙනම track කරයි
+        amount: { type: Number, required: true }, // the amount actually applied to balanceDue (applied amount)
+        // 🆕 When a Payment is made, tracks the amount actually given and the remainder (Overpayment) separately
         paidAmount: { type: Number, default: null },
         changeGiven: { type: Number, default: 0 },
-        // 🆕 SHIFT RECONCILIATION: මේ ගෙවීම කලේ කව්ද + මොන ක්‍රමයෙන්ද (Cash/Card/Bank) කියලා සටහන් කරයි -
-        // "Cash" ගෙවීම් (type: "payment") විතරයි Shift Close කරන වෙලාවේ Cash Drawer ගණනයෙන් අඩු වෙන්නේ.
+        // 🆕 SHIFT RECONCILIATION: Records who made this payment + by which method (Cash/Card/Bank) -
+        // only "Cash" payments (type: "payment") are deducted from the Cash Drawer calculation when a Shift is Closed.
         cashier: { type: String, default: "" },
         paymentMethod: { type: String, enum: ["Cash", "Card", "Bank Transfer", "Other"], default: "Cash" },
         description: { type: String },
-        // 🛠️ NEW (Step 2 - GRN Multi-item): එකම Invoice/GRN එකකින් ලැබුණු Products කිහිපයම මෙතනින් track වේ
+        // 🛠️ NEW (Step 2 - GRN Multi-item): Multiple Products received on the same Invoice/GRN are tracked here
         items: [
           {
             productName: { type: String },
             quantity: { type: Number },
             costPrice: { type: Number },
             subtotal: { type: Number },
-            // 🛠️ NEW: මේ item එකේදී stock එක "add" කලාද "set" (overwrite) කලාද කියලා audit trail එකක්
+            // 🛠️ NEW: An audit trail of whether stock was "added" or "set" (overwritten) for this item
             stockMode: { type: String, enum: ["add", "set"], default: "add" },
           },
         ],

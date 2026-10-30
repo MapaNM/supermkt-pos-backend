@@ -1,36 +1,36 @@
 const mongoose = require("mongoose");
 
 // 🆕 SHIFT / CASH DRAWER RECONCILIATION
-// Cashier කෙනෙක් කවුන්ටරයේ වැඩ පටන් ගන්න කලින් (Opening Float එකක් සටහන් කරලා) Shift එකක් "open"
-// කරනවා, වැඩ ඉවර උනාම (actual counted cash එක ඇතුලත් කරලා) "close" කරනවා. Close කරන වෙලාවේ
-// backend එකම ඒ Shift කාලය තුළ වුනු Cash Sales + Cash Refunds වලින් "Expected Cash" එක ගණනය කරලා,
-// cashier ගේ Counted Cash එකත් සමග compare කරලා Over/Short එක පෙන්වනවා - End-of-day cash
-// accountability එකට.
+// Before a Cashier starts work at the counter, they "open" a Shift (recording an Opening Float),
+// and "close" it when work is finished (entering the actual counted cash). At Close time
+// the backend itself calculates the "Expected Cash" from the Cash Sales + Cash Refunds during that Shift period,
+// compares it with the cashier's Counted Cash and shows the Over/Short - for End-of-day cash
+// accountability.
 const ShiftSchema = new mongoose.Schema(
   {
-    cashier: { type: String, required: true }, // username - Sale.cashier එකේම convention එක
+    cashier: { type: String, required: true }, // username - same convention as Sale.cashier
 
-    openingFloat: { type: Number, required: true, default: 0 }, // Shift එක පටන් ගන්න වෙලාවේ Drawer එකේ තිබිච්ච මුදල
+    openingFloat: { type: Number, required: true, default: 0 }, // Amount in the Drawer at the time the Shift started
     openedAt: { type: Date, default: Date.now },
 
     status: { type: String, enum: ["open", "closed"], default: "open" },
 
-    // 🆕 Close කරන වෙලාවේ විතරක් පුරවනු ලැබේ
+    // 🆕 Filled only at Close time
     closedAt: { type: Date, default: null },
-    cashSales: { type: Number, default: 0 }, // මේ Shift එක තුළ Cash payment method එකෙන් වුනු Sales එකතුව
-    cashRefunds: { type: Number, default: 0 }, // මේ Shift එක තුළ Cash refund method එකෙන් දුන් Returns එකතුව
-    // 🆕 SHIFT RECONCILIATION (Customer/Supplier): Cash වලින් විතරක් ලැබුණු Customer Credit Payments
-    // සහ Cash වලින් විතරක් ගෙව්ව Supplier Payments මේ Shift එක තුළ කොච්චරද කියලා වෙනම track කරයි -
-    // Admin කෙනෙකුට Shift History එකේදී මේ breakdown එක පැහැදිලිව පේන්න ඕන (transparency).
-    creditPaymentsCashIn: { type: Number, default: 0 }, // Customer ගෙන් Cash වලින් ලැබුණු ණය ගෙවීම් එකතුව
-    supplierPaymentsCashOut: { type: Number, default: 0 }, // Supplier ට Cash වලින් ගෙව්ව මුදල් එකතුව
-    creditGiven: { type: Number, default: 0 }, // 🆕 මේ Shift එකේදී ණයට (Customer Credit) ලබා දුන් මුදල (Info විතරයි, Expected Cash එකට බලපෑමක් නෑ)
-    creditGivenGross: { type: Number, default: 0 }, // 🆕 Return වලට කලින් ණයට දුන් මුළු මුදල
-    creditReturned: { type: Number, default: 0 }, // 🆕 Return වලින් ණය පොතෙන් අඩු කළ මුදල (creditGiven = creditGivenGross − creditReturned)
-    creditBillCount: { type: Number, default: 0 }, // 🆕 ණයට දුන් බිල් ගණන
+    cashSales: { type: Number, default: 0 }, // Total Sales made via the Cash payment method during this Shift
+    cashRefunds: { type: Number, default: 0 }, // Total Returns refunded via the Cash refund method during this Shift
+    // 🆕 SHIFT RECONCILIATION (Customer/Supplier): Separately tracks how much Customer Credit Payments were received only in Cash
+    // and how much Supplier Payments were paid only in Cash during this Shift -
+    // an Admin should be able to see this breakdown clearly in the Shift History (transparency).
+    creditPaymentsCashIn: { type: Number, default: 0 }, // Total credit payments received in Cash from Customers
+    supplierPaymentsCashOut: { type: Number, default: 0 }, // Total amount paid in Cash to Suppliers
+    creditGiven: { type: Number, default: 0 }, // 🆕 Amount given on credit (Customer Credit) during this Shift (Info only, does not affect Expected Cash)
+    creditGivenGross: { type: Number, default: 0 }, // 🆕 Total amount given on credit before Returns
+    creditReturned: { type: Number, default: 0 }, // 🆕 Amount deducted from the credit ledger via Returns (creditGiven = creditGivenGross − creditReturned)
+    creditBillCount: { type: Number, default: 0 }, // 🆕 Number of bills given on credit
     expectedCash: { type: Number, default: 0 }, // openingFloat + cashSales - cashRefunds + creditPaymentsCashIn - supplierPaymentsCashOut
-    closingCountedCash: { type: Number, default: null }, // Cashier ඇත්තටම ගාණ කරලා report කරපු මුදල
-    overShort: { type: Number, default: 0 }, // closingCountedCash - expectedCash (+ නම් වැඩි, - නම් අඩු)
+    closingCountedCash: { type: Number, default: null }, // Amount the Cashier actually counted and reported
+    overShort: { type: Number, default: 0 }, // closingCountedCash - expectedCash (+ means over, - means short)
 
     notes: { type: String, default: "" },
   },

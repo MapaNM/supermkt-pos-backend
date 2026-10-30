@@ -3,39 +3,39 @@ const router = express.Router();
 const Promotion = require("../models/Promotion");
 const { requireAdmin } = require("../middleware/auth"); // 🔐 note: `protect` already applied at /api/promotions in server.js
 
-// 1. සියලුම Promotions ලබාගැනීම (Billing Screen එකටත්, Admin Panel එකටත් දෙකටම)
+// 1. Get all Promotions (for both the Billing Screen and the Admin Panel)
 router.get("/", async (req, res) => {
   try {
     const promotions = await Promotion.find().sort({ type: 1, createdAt: -1 });
     res.status(200).json(promotions);
   } catch (error) {
-    console.error("දත්ත ලබාගැනීම අසාර්ථකයි", error);
-    res.status(500).json({ message: "දත්ත ලබාගැනීම අසාර්ථකයි" });
+    console.error("Failed to fetch data", error);
+    res.status(500).json({ message: "Failed to fetch data" });
   }
 });
 
-// 2. අලුත් Promotion එකක් ඇතුලත් කිරීම
+// 2. Add a new Promotion
 router.post("/add", requireAdmin, async (req, res) => {
   try {
     const { type, name, discountPercent } = req.body;
     if (!["occasion", "loyalty"].includes(type)) {
-      return res.status(400).json({ message: "Type එක 'occasion' හෝ 'loyalty' විය යුතුය" });
+      return res.status(400).json({ message: "Type must be either 'occasion' or 'loyalty'" });
     }
     const newPromotion = new Promotion({ type, name, discountPercent, isActive: false });
     await newPromotion.save();
-    res.status(201).json({ message: "Promotion එක සාර්ථකව ඇතුලත් කලා! 🎉", promotion: newPromotion });
+    res.status(201).json({ message: "Promotion added successfully! 🎉", promotion: newPromotion });
   } catch (error) {
-    console.error("ඇතුලත් කිරීම අසාර්ථකයි", error);
-    res.status(500).json({ message: "ඇතුලත් කිරීම අසාර්ථකයි" });
+    console.error("Failed to add", error);
+    res.status(500).json({ message: "Failed to add" });
   }
 });
 
-// 3. Promotion එකක් Update කිරීම
-// 🔐 SECURITY FIX: කලින් req.body එකම whole එකක් විදිහට DB update එකට දැම්මා (Mass-Assignment
-// Vulnerability) - extra field එකක් (උදා: isActive) request body එකට එකතු කරලා, "Activate/Deactivate"
-// routes දෙක bypass කරලා, එකවර type එකකම Promotion කිහිපයක් active කරගන්න පුළුවන් උනා. දැන් මේ
-// Form එකෙන් ඇත්තටම එවන fields (name, discountPercent, type) විතරක් allow-list කරලා, isActive
-// පාලනය වෙන්නේ /activate සහ /deactivate routes දෙකෙන් විතරයි.
+// 3. Update a Promotion
+// 🔐 SECURITY FIX: Previously the whole req.body was passed into the DB update (Mass-Assignment
+// Vulnerability) - by adding an extra field (e.g. isActive) to the request body, the "Activate/Deactivate"
+// routes could be bypassed and multiple Promotions of the same type could be activated at once. Now only the fields
+// this Form actually sends (name, discountPercent, type) are allow-listed, and isActive
+// is controlled only by the /activate and /deactivate routes.
 router.put("/update/:id", requireAdmin, async (req, res) => {
   try {
     const { name, discountPercent, type } = req.body;
@@ -45,53 +45,53 @@ router.put("/update/:id", requireAdmin, async (req, res) => {
     if (type !== undefined) updateFields.type = type;
 
     const updated = await Promotion.findByIdAndUpdate(req.params.id, updateFields, { returnDocument: "after", runValidators: true });
-    if (!updated) return res.status(404).json({ message: "Promotion එක සොයාගත නොහැක" });
-    res.json({ message: "යාවත්කාලීන කිරීම සාර්ථකයි! 🔄", promotion: updated });
+    if (!updated) return res.status(404).json({ message: "Promotion not found" });
+    res.json({ message: "Updated successfully! 🔄", promotion: updated });
   } catch (error) {
-    console.error("යාවත්කාලීන කිරීම අසාර්ථකයි", error);
-    res.status(500).json({ message: "යාවත්කාලීන කිරීම අසාර්ථකයි" });
+    console.error("Failed to update", error);
+    res.status(500).json({ message: "Failed to update" });
   }
 });
 
-// 4. Promotion එකක් Activate කිරීම (එකම type එකේ අනිත් සියල්ල auto-deactivate වේ - එකවර active විය හැක්කේ එකයි)
+// 4. Activate a Promotion (all others of the same type are auto-deactivated - only one can be active at a time)
 router.put("/activate/:id", requireAdmin, async (req, res) => {
   try {
     const promotion = await Promotion.findById(req.params.id);
-    if (!promotion) return res.status(404).json({ message: "Promotion එක සොයාගත නොහැක" });
+    if (!promotion) return res.status(404).json({ message: "Promotion not found" });
 
-    // 🛠️ එකම Type එකේ (occasion/loyalty) අනිත් සියලුම Promotions deactivate කරයි
+    // 🛠️ Deactivates all other Promotions of the same Type (occasion/loyalty)
     await Promotion.updateMany({ type: promotion.type, _id: { $ne: promotion._id } }, { isActive: false });
 
     promotion.isActive = true;
     await promotion.save();
 
-    res.json({ message: `"${promotion.name}" Activate කලා! ✅`, promotion });
+    res.json({ message: `"${promotion.name}" Activated! ✅`, promotion });
   } catch (error) {
-    console.error("Activate කිරීම අසාර්ථකයි", error);
-    res.status(500).json({ message: "Activate කිරීම අසාර්ථකයි" });
+    console.error("Failed to Activate", error);
+    res.status(500).json({ message: "Failed to Activate" });
   }
 });
 
-// 5. Promotion එකක් Deactivate කිරීම
+// 5. Deactivate a Promotion
 router.put("/deactivate/:id", requireAdmin, async (req, res) => {
   try {
     const promotion = await Promotion.findByIdAndUpdate(req.params.id, { isActive: false }, { returnDocument: "after" });
-    if (!promotion) return res.status(404).json({ message: "Promotion එක සොයාගත නොහැක" });
-    res.json({ message: `"${promotion.name}" Deactivate කලා!`, promotion });
+    if (!promotion) return res.status(404).json({ message: "Promotion not found" });
+    res.json({ message: `"${promotion.name}" Deactivated!`, promotion });
   } catch (error) {
-    console.error("Deactivate කිරීම අසාර්ථකයි", error);
-    res.status(500).json({ message: "Deactivate කිරීම අසාර්ථකයි" });
+    console.error("Failed to Deactivate", error);
+    res.status(500).json({ message: "Failed to Deactivate" });
   }
 });
 
-// 6. Promotion එකක් මකා දැමීම
+// 6. Delete a Promotion
 router.delete("/delete/:id", requireAdmin, async (req, res) => {
   try {
     await Promotion.findByIdAndDelete(req.params.id);
-    res.status(200).json({ message: "Promotion එක මකා දැමුවා! 🗑️" });
+    res.status(200).json({ message: "Promotion deleted! 🗑️" });
   } catch (error) {
-    console.error("මකා දැමීම අසාර්ථකයි", error);
-    res.status(500).json({ message: "මකා දැමීම අසාර්ථකයි" });
+    console.error("Failed to delete", error);
+    res.status(500).json({ message: "Failed to delete" });
   }
 });
 

@@ -1,23 +1,45 @@
 const express = require('express');
 const mongoose = require('mongoose'); // 🔐 needed for session/transaction support
 const router = express.Router();
-const RouteError = require('../utils/RouteError');
+const RouteError = require('../utils/routeError');
 const Product = require('../models/Product');
 const Sale = require('../models/Sale');
 const Customer = require('../models/Customer');
+const Supplier = require('../models/Supplier');
 const Return = require('../models/Return');
 const Counter = require('../models/Counter');
 const Promotion = require('../models/Promotion'); // 🔐 needed to verify bill-level discounts server-side
+const { requireOpenShift } = require('../middleware/requireShift'); // 🔐 Enforce Shift requirement
 const { requireAdmin } = require('../middleware/auth'); // 🔐 note: `protect` is already applied to the whole /api/products path in server.js
 
-// 🛠️ NEW: JavaScript Floating-Point Precision Errors (0.1 + 0.2 = 0.30000000000000004 වගේ) නිවැරදි කිරීමට
-// Stock එකට Add/Subtract කරන හැම තැනකම මේකෙන් Round කර, Dirty Values (3.5500000000000007 වගේ) DB එකට Save වීම වළක්වයි
+// 🆕 Net Revenue/Profit per bill (deducting returned quantities and accounting for Bill-level discounts) - used by both Sales Summary and
+// Dashboard so they share one calculation: use this helper. Profit = Revenue − (Cost of the items that are not deducted).
+// (Previously the Bill-level Occasion discount was not deducted from Profit, so profit on discounted bills appeared higher than it was.)
+function saleNetFigures(sale) {
+  const items = sale.items || [];
+  let gross = 0, keptGross = 0, keptCost = 0;
+  for (const it of items) {
+    const qty = Number(it.qty) || 0;
+    const kept = Math.max(0, qty - (Number(it.returnedQty) || 0));
+    const price = Number(it.price) || 0;
+    gross += price * qty;
+    keptGross += price * kept;
+    keptCost += (Number(it.costPrice) || 0) * kept;
+  }
+  const factor = gross > 0 ? (Number(sale.totalAmount) || 0) / gross : 1; // Bill-level discount ratio
+  const isReturned = sale.status === 'Returned' || sale.status === 'PartiallyReturned';
+  const revenue = isReturned ? keptGross * factor : (Number(sale.totalAmount) || 0);
+  return { revenue, profit: revenue - keptCost, cost: keptCost };
+}
+
+// 🛠️ NEW: To correct JavaScript Floating-Point Precision Errors (such as 0.1 + 0.2 = 0.30000000000000004)
+// Round with this wherever Stock is Added/Subtracted, to prevent Dirty Values (such as 3.5500000000000007) from being Saved to the DB
 const roundQty = (num) => Math.round((parseFloat(num) || 0) * 1000) / 1000;
 
 // 🆕 PROFESSIONAL SEQUENTIAL INVOICE NUMBER GENERATOR
-// 🔐 `session` (optional) - checkout එක transaction එකක් ඇතුලේ run කරද්දී, invoice number එකේ
-// counter increment එකත් ඒ transaction එකටම join කරගන්න - transaction එක rollback උනොත් counter
-// එකත් rollback වෙනවා, නැත්තම් "invoice number skip" වෙන pattern එකක් හැදෙනවා.
+// 🔐 `session` (optional) - when checkout runs inside a transaction, the invoice number's
+// counter increment also joins that same transaction - if the transaction rolls back, the counter
+// rolls back too; otherwise an "invoice number skip" pattern would occur.
 async function generateInvoiceNo(session = null) {
   const now = new Date();
   const dateStr = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}`;
@@ -32,7 +54,7 @@ async function generateInvoiceNo(session = null) {
   return `INV-${dateStr}-${String(counter.seq).padStart(4, "0")}`;
 }
 
-// 1. භාණ්ඩයක් ඇතුලත් කිරීම (Default Batch එකක් සමඟ)
+// 1. Add an item (with a Default Batch)
 router.post("/add", requireAdmin, async (req, res) => {
   try {
     const { name, price, marketPrice, costPrice, stock, discount, barcode, unit, category, minStockLevel, preferredSupplierId, expiryDate, batches } = req.body;
@@ -42,7 +64,7 @@ router.post("/add", requireAdmin, async (req, res) => {
     const parsedMarket = parseFloat(marketPrice) || parsedPrice;
     const parsedStock = roundQty(stock);
 
-    // Batches එවා නැත්නම් default initial batch එකක් සාදයි
+    // If no Batches are sent, creates a default initial batch
     const initialBatches = (batches && Array.isArray(batches) && batches.length > 0)
       ? batches
       : [{
@@ -62,7 +84,7 @@ router.post("/add", requireAdmin, async (req, res) => {
       stock: parsedStock,
       discount: parseFloat(discount) || 0,
       barcode: barcode || "",
-      unit: unit ?? "Kg", // 🛠️ FIX: "" (Unit නැත, intentional) වලට "Kg" force නොවෙන්න - undefined/null වලට විතරක් fallback
+      unit: unit ?? "Kg", // 🛠️ FIX: so that "" (no Unit, intentional) is not forced to "Kg" - fall back only for undefined/null
       category: category || "Grocery",
       minStockLevel: parseFloat(minStockLevel) || 5,
       preferredSupplierId: preferredSupplierId || null,
@@ -71,29 +93,29 @@ router.post("/add", requireAdmin, async (req, res) => {
     });
 
     await newProduct.save();
-    res.status(201).json({ message: "භාණ්ඩය සාර්ථකව ඇතුලත් කලා! ✅", product: newProduct });
+    res.status(201).json({ message: "Item added successfully! ✅", product: newProduct });
   } catch (error) {
-    console.error("ඇතුලත් කිරීම අසාර්ථකයි", error);
-    res.status(500).json({ message: "ඇතුලත් කිරීම අසාර්ථකයි" });
+    console.error("Failed to add item", error);
+    res.status(500).json({ message: "Failed to add item" });
   }
 });
 
-// 2. සියලුම භාණ්ඩ ලබාගැනීම
+// 2. Get all items
 router.get('/', async (req, res) => {
   try {
     const products = await Product.find();
     res.status(200).json(products);
   } catch (error) {
-    console.error("දත්ත ලබාගැනීම අසාර්ථකයි", error);
-    res.status(500).json({ message: "දත්ත ලබාගැනීම අසාර්ථකයි" });
+    console.error("Failed to fetch data", error);
+    res.status(500).json({ message: "Failed to fetch data" });
   }
 });
 
-// 3. භාණ්ඩයක් යාවත්කාලීන කිරීම
-// 🔐 SECURITY FIX: කලින් req.body එකම whole එකක් විදිහට DB update එකට දැම්මා (Mass-Assignment
-// Vulnerability) - Edit Form එකෙන් එවන නැති extra field එකක්වත් request body එකට එකතු කරලා
-// එව්වොත් ඒකත් update වෙනවා. දැන් Edit Product Form එකෙන් ඇත්තටම එවන fields විතරක් allow-list
-// කරලා, ඒවා විතරක් DB එකට යවනවා.
+// 3. Update an item
+// 🔐 SECURITY FIX: Previously the whole req.body was passed to the DB update as-is (Mass-Assignment
+// Vulnerability) - if extra fields not sent by the Edit Form were added to the request body
+// and sent, they would be updated too. Now only the fields the Edit Product Form actually sends are allow-listed,
+// and only those are passed to the DB.
 router.put("/update/:id", requireAdmin, async (req, res) => {
   try {
     const {
@@ -123,24 +145,24 @@ router.put("/update/:id", requireAdmin, async (req, res) => {
     );
 
     if (!updatedProduct) {
-      return res.status(404).json({ message: "භාණ්ඩය සොයාගත නොහැක" });
+      return res.status(404).json({ message: "Item not found" });
     }
 
-    res.json({ message: "යාවත්කාලීන කිරීම සාර්ථකයි! 🔄", product: updatedProduct });
+    res.json({ message: "Updated successfully! 🔄", product: updatedProduct });
   } catch (error) {
-    console.error("යාවත්කාලීන කිරීම අසාර්ථකයි", error);
-    res.status(500).json({ message: "යාවත්කාලීන කිරීම අසාර්ථකයි" });
+    console.error("Update failed", error);
+    res.status(500).json({ message: "Update failed" });
   }
 });
 
-// 4. භාණ්ඩයක් මකා දැමීම
+// 4. Delete an item
 router.delete('/delete/:id', requireAdmin, async (req, res) => {
   try {
     await Product.findByIdAndDelete(req.params.id);
-    res.status(200).json({ message: "භාණ්ඩය සාර්ථකව මකා දැමුවා! 🗑️" });
+    res.status(200).json({ message: "Item deleted successfully! 🗑️" });
   } catch (error) {
-    console.error("මකා දැමීම අසාර්ථකයි", error);
-    res.status(500).json({ message: "මකා දැමීම අසාර්ථකයි" });
+    console.error("Delete failed", error);
+    res.status(500).json({ message: "Delete failed" });
   }
 });
 
@@ -166,46 +188,46 @@ router.get('/expiring', requireAdmin, async (req, res) => {
 
     res.status(200).json(result);
   } catch (error) {
-    console.error("Expiry දත්ත ලබාගැනීම අසාර්ථකයි", error);
-    res.status(500).json({ message: "Expiry දත්ත ලබාගැනීම අසාර්ථකයි" });
+    console.error("Failed to fetch Expiry data", error);
+    res.status(500).json({ message: "Failed to fetch Expiry data" });
   }
 });
 
 // 5. CHECKOUT ROUTE (BATCH-WISE STOCK & MULTI-PRICE SUPPORT)
-// 🔐 UPDATED: Checkout එකේ මිල/වට්ටම දැන් client එකෙන් එවන දේම විශ්වාස කරන්නේ නෑ - DB එකේ
-// තියෙන සැබෑ Product/Batch මිලට සහ active Occasion Promotion එකට සාපේක්ෂව server එකෙන්ම
-// validate කරලා, ගැලපෙන්නේ නැත්නම් මුළු checkout එකම reject කරයි. "temp_" (manual typed)
-// items වලට පමණයි client එකේ price එක ම විශ්වාස කරන්නේ - ඒවාට DB record එකක් නැති නිසා.
-const PRICE_TOLERANCE = 0.01; // floating-point rounding allowance, රු.1 cent ට අඩු වෙනස්කම් විතරයි
+// 🔐 UPDATED: Checkout no longer trusts the price/discount sent by the client - the server itself validates against the actual Product/Batch price
+// stored in the DB and the active Occasion Promotion, and rejects the entire checkout if they do not match.
+// The client's price is trusted only for "temp_" (manually typed)
+// items - because they have no DB record.
+const PRICE_TOLERANCE = 0.01; // floating-point rounding allowance, differences of less than Rs.1 cent only
 
-router.post('/checkout', async (req, res) => {
+router.post('/checkout', requireOpenShift(), async (req, res) => {
   const { cartItems, cashierName, paymentMethod, customerId, cashReceived, balanceAmount, amountPaid, billDiscountSource, billDiscountPercent: clientBillDiscountPercent } = req.body;
 
   if (!Array.isArray(cartItems) || cartItems.length === 0) {
-    return res.status(400).json({ message: "බිල හිස්ව පවතී!" });
+    return res.status(400).json({ message: "The bill is empty!" });
   }
 
-  // 🔐 TRANSACTIONS: සම්පූර්ණ checkout එකම (stock අඩු කිරීම + customer credit + Sale record
-  // හැදීම) එක atomic unit එකක් විදිහට run කරයි - මැදදී step එකක් fail උනොත් (stock insufficient,
-  // server crash, DB error) කිසිම අර්ධ වෙනසක් DB එකේ save වෙන්නේ නෑ, සියල්ලම rollback වෙනවා.
-  // (⚠️ මේකට MongoDB Replica Set එකක් ඕන - MongoDB Atlas default එකෙන්ම replica set, ඒ නිසා
-  // production එකේ problem එකක් නෑ. සම්පූර්ණයෙන්ම local standalone mongod එකක නම් transactions
-  // වැඩ කරන්නේ නෑ.)
+  // 🔐 TRANSACTIONS: The entire checkout (reducing stock + customer credit + creating the Sale record)
+  // runs as one atomic unit - if any step fails midway (stock insufficient,
+  // server crash, DB error), no partial changes are saved to the DB and everything is rolled back.
+  // (⚠️ This requires a MongoDB Replica Set - MongoDB Atlas is a replica set by default, so
+  // it is not a problem in production. On a purely local standalone mongod, transactions
+  // will not work.)
   const session = await mongoose.startSession();
   let responsePayload = null;
 
   try {
     await session.withTransaction(async () => {
-      // === PASS 1: කිසිම stock එකක් අඩු කරන්න කලින්, හැම item එකක්ම DB එකට සාපේක්ෂව validate කරයි ===
+      // === PASS 1: Before reducing any stock, validate every item against the DB ===
       const resolvedItems = [];
 
       for (const item of cartItems) {
         const qty = parseFloat(item.qty);
         if (!qty || qty <= 0) {
-          throw new RouteError(400, `"${item.name}" සඳහා නිවැරදි ප්‍රමාණයක් නැත!`);
+          throw new RouteError(400, `Invalid quantity for "${item.name}"!`);
         }
 
-        // Manual typed (ad-hoc) items - DB record එකක් නැති නිසා මේවට සම්පූර්ණ validation කරන්න බෑ
+        // Manual typed (ad-hoc) items - full validation is not possible for these because they have no DB record
         if (!item._id || item._id.toString().startsWith("temp_")) {
           resolvedItems.push({ item, qty, product: null, batch: null, canonical: null });
           continue;
@@ -213,7 +235,7 @@ router.post('/checkout', async (req, res) => {
 
         const product = await Product.findById(item._id).session(session);
         if (!product) {
-          throw new RouteError(404, `"${item.name}" භාණ්ඩය සොයාගත නොහැක - List එක Refresh කරලා නැවත උත්සාහ කරන්න!`);
+          throw new RouteError(404, `Item "${item.name}" not found - please refresh the list and try again!`);
         }
 
         let batch = null;
@@ -238,44 +260,44 @@ router.post('/checkout', async (req, res) => {
         const submittedDiscount = parseFloat(item.discount || 0);
 
         if (Math.abs(submittedPrice - canonical.price) > PRICE_TOLERANCE) {
-          throw new RouteError(409, `"${item.name}" හි මිල වෙනස් වී ඇත! List එක Refresh කරලා නැවත උත්සාහ කරන්න.`);
+          throw new RouteError(409, `The price of "${item.name}" has changed! Please refresh the list and try again.`);
         }
         if (Math.abs(submittedDiscount - canonical.discountAmount) > PRICE_TOLERANCE) {
-          throw new RouteError(409, `"${item.name}" හි වට්ටම වෙනස් වී ඇත! List එක Refresh කරලා නැවත උත්සාහ කරන්න.`);
+          throw new RouteError(409, `The discount on "${item.name}" has changed! Please refresh the list and try again.`);
         }
         if (qty > canonical.stock + 0.001) {
-          throw new RouteError(400, `"${item.name}" සඳහා ප්‍රමාණවත් තොගයක් නැත! (ඇත්තේ: ${canonical.stock})`);
+          throw new RouteError(400, `Insufficient stock for "${item.name}"! (Available: ${canonical.stock})`);
         }
 
         resolvedItems.push({ item, qty, product, batch, canonical });
       }
 
-      // 🐛 FIX: කලින් server එක active Occasion promo එකක් තිබුණොත් cashier "Apply" කලේ නැතත්
-      // ස්වයංක්‍රීයව % එක අඩු කළා - ඒ නිසා Receipt/cash එකතු කරපු මුදලයි (වට්ටමක් නැතුව) Sales Report
-      // එකේ මුදලයි (වට්ටම් සහිතව) වෙනස් උනා (උදා: 1650 vs 1485 = හරියටම 10%). දැන් cashier ඇත්තටම
-      // Apply කලොත් (billDiscountSource === "occasion") විතරයි වට්ටම යෙදෙන්නේ. % එක client එකෙන්
-      // විශ්වාස කරන්නේ නෑ - DB එකේ active promo එකේ % එකම පාවිච්චි කරයි, ඒත් client පෙන්නපු % එකත්
-      // DB එකත් ගැලපෙන්නේ නැත්නම් (promo එක මැදදී වෙනස් වෙලා) bill එක reject කරයි.
+      // 🐛 FIX: Previously, if an active Occasion promo existed, the server automatically reduced the % even when the cashier had not clicked "Apply" -
+      // so the amount shown on the Receipt/collected as cash (without the discount) and the amount in the Sales Report
+      // (with the discount) differed (e.g. 1650 vs 1485 = exactly 10%). Now the discount is applied only if the cashier actually
+      // clicks Apply (billDiscountSource === "occasion"). The % from the client is not
+      // trusted - the % of the active promo in the DB is used, but if the % shown by the client
+      // and the DB do not match (the promo changed midway), the bill is rejected.
       let billDiscountPercent = 0;
       let billDiscountName = null;
       if (billDiscountSource === "occasion") {
         const activePromo = await Promotion.findOne({ type: "occasion", isActive: true }).session(session);
         if (!activePromo) {
-          throw new RouteError(409, "Bill Discount Promotion එක දැන් Active නැත! Cart එක Refresh කරලා නැවත උත්සාහ කරන්න.");
+          throw new RouteError(409, "The Bill Discount Promotion is no longer Active! Please refresh the Cart and try again.");
         }
         if (Math.abs((parseFloat(clientBillDiscountPercent) || 0) - (activePromo.discountPercent || 0)) > 0.001) {
-          throw new RouteError(409, "Bill Discount % එක වෙනස් වී ඇත! Cart එක Refresh කරලා නැවත උත්සාහ කරන්න.");
+          throw new RouteError(409, "The Bill Discount % has changed! Please refresh the Cart and try again.");
         }
         billDiscountPercent = activePromo.discountPercent || 0;
         billDiscountName = activePromo.name;
       }
 
-      // === PASS 2: validate උනා - දැන් ATOMIC, race-safe decrements වලින් stock එක අඩු කරලා Sale එක හදයි ===
-      // 🔐 RACE CONDITION FIX: කලින් "read product -> subtract in JS -> save" pattern එක පාවිච්චි
-      // කලේ - දෙන්නෙක් එකම අන්තිම item එක එකවර checkout කලොත්, දෙන්නටම stock ප්‍රමාණවත් බව පෙනිලා
-      // දෙන්නම sell කරගන්න පුළුවන් උනා (actual stock එකට වඩා විකුණලා negative යනවා). දැන් DB එකටම
-      // "stock ප්‍රමාණවත් නම් විතරක් අඩු කරන්න" කියලා එකම atomic query එකකින් කියනවා - දෙවෙනි
-      // request එකට ඒ moment එකේදීම ප්‍රමාණවත් stock නැති බව DB එකෙන්ම පේනවා, round-trip race නැහැ.
+      // === PASS 2: validation passed - now reduce stock with ATOMIC, race-safe decrements and create the Sale ===
+      // 🔐 RACE CONDITION FIX: Previously the "read product -> subtract in JS -> save" pattern was used -
+      // if two people checked out the very last item at the same time, both saw sufficient stock and
+      // both were able to sell it (selling more than the actual stock and going negative). Now we tell the DB itself,
+      // in a single atomic query, to "reduce only if stock is sufficient" - the second
+      // request sees from the DB itself at that very moment that there is not enough stock, so there is no round-trip race.
       let totalAmount = 0;
       let totalProfit = 0;
       let totalCustomerSavings = 0;
@@ -283,7 +305,7 @@ router.post('/checkout', async (req, res) => {
 
       for (const { item, qty, product, batch, canonical } of resolvedItems) {
         if (!product) {
-          // Manual typed item - කලින් හැටියටම client එකේ price එකම පාවිච්චි කරයි
+          // Manual typed item - as before, the client's price is used
           const tempOriginalP = parseFloat(item.price);
           totalAmount += Math.round(tempOriginalP * qty * 100) / 100;
           totalProfit += (tempOriginalP * 0.15) * qty;
@@ -312,13 +334,13 @@ router.post('/checkout', async (req, res) => {
 
         const updatedProduct = await Product.findOneAndUpdate(filter, { $inc: inc }, { session, new: true });
         if (!updatedProduct) {
-          // මීට අතර (PASS 1 validate උනාට පස්සේ) stock එක වෙනත් checkout එකකින් අඩු වෙලා ඇති -
-          // whole transaction එකම abort කරලා, cashier ට list එක refresh කරන්න කියයි.
-          throw new RouteError(409, `"${item.name}" හි තොගය දැන් වෙනස් වී ඇත (වෙනත් විකිණීමක් එකවර සිදු විය)! List එක Refresh කරලා නැවත උත්සාහ කරන්න.`);
+          // In the meantime (after PASS 1 validation) the stock may have been reduced by another checkout -
+          // abort the whole transaction and tell the cashier to refresh the list.
+          throw new RouteError(409, `The stock of "${item.name}" has just changed (another sale occurred at the same time)! Please refresh the list and try again.`);
         }
 
         const finalPriceAfterDiscount = canonical.price - canonical.discountAmount;
-        const itemTotal = Math.round(finalPriceAfterDiscount * qty * 100) / 100; // 🛠️ line total cents 2කට (client එකත් මේකමයි)
+        const itemTotal = Math.round(finalPriceAfterDiscount * qty * 100) / 100; // 🛠️ line total to 2 decimal places (the client does the same)
         const itemCost = canonical.costPrice * qty;
         const itemProfit = itemTotal - itemCost;
         const itemSavings = ((canonical.marketPrice || canonical.price) - finalPriceAfterDiscount) * qty;
@@ -339,20 +361,21 @@ router.post('/checkout', async (req, res) => {
         });
       }
 
-      // 🐛 BUG FIX: කලින් මේ Bill-level Occasion Discount එක (billDiscountPercent) backend එකේ
-      // කිසි තැනකදී totalAmount එකෙන් අඩු වුනේම නෑ - Receipt එකේ විතරක් පෙන්නුවා, ඇත්තටම
-      // ගණන් හදලා තිබුනේ Full Price එකටම! දැන් server-verified % එකෙන් actual total එකෙන් අඩු කරයි.
+      // 🐛 BUG FIX: Previously this Bill-level Occasion Discount (billDiscountPercent) was never
+      // deducted from totalAmount anywhere in the backend - it was only shown on the Receipt, while the actual
+      // calculation was done on the Full Price! Now the server-verified % is deducted from the actual total.
       totalAmount = Math.round(totalAmount * 100) / 100;
       const billDiscountAmount = Math.round(((totalAmount * billDiscountPercent) / 100) * 100) / 100;
       totalAmount = Math.max(0, Math.round((totalAmount - billDiscountAmount) * 100) / 100);
       totalCustomerSavings += billDiscountAmount;
+      totalProfit -= billDiscountAmount; // 🛠️ The Bill-level discount must also be deducted from profit (previously it was not)
 
       const paid = parseFloat(amountPaid);
       const safePaid = isNaN(paid) ? totalAmount : paid;
 
-      // 🔐 පාරිභෝගිකයෙක් සම්බන්ධ කර නැතුව ණයට විකුණන්න බෑ - කලින් මේක frontend එකේ විතරක් check කලේ
+      // 🔐 Selling on credit without a linked customer is not allowed - previously this was only checked on the frontend
       if (safePaid < totalAmount - PRICE_TOLERANCE && !customerId) {
-        throw new RouteError(400, "හිඟ මුදලක් පවතී! කරුණාකර පාරිභෝගිකයෙකු සම්බන්ධ කරන්න. 👤");
+        throw new RouteError(400, "An outstanding balance remains! Please link a customer. 👤");
       }
 
       let creditToRecord = 0;
@@ -365,7 +388,7 @@ router.post('/checkout', async (req, res) => {
           customer.creditHistory.push({
             amount: creditToRecord,
             date: new Date(),
-            description: `ණයට ගැනීම (Bill Total: රු.${totalAmount.toFixed(2)}, Paid: රු.${safePaid.toFixed(2)})`
+            description: `Credit purchase (Bill Total: Rs.${totalAmount.toFixed(2)}, Paid: Rs.${safePaid.toFixed(2)})`
           });
           await customer.save({ session });
         }
@@ -390,7 +413,7 @@ router.post('/checkout', async (req, res) => {
       await newSale.save({ session });
 
       responsePayload = {
-        message: billDiscountName ? `බිල සාර්ථකව නිම කලා! 🎉 "${billDiscountName}" (${billDiscountPercent}%) අයින් කලා` : "බිල සාර්ථකව නිම කලා! ✅",
+        message: billDiscountName ? `Bill completed successfully! 🎉 "${billDiscountName}" (${billDiscountPercent}%) deducted` : "Bill completed successfully! ✅",
         amountDue: creditToRecord,
         saleId: newSale._id,
         invoiceNo
@@ -402,10 +425,140 @@ router.post('/checkout', async (req, res) => {
     if (error instanceof RouteError) {
       return res.status(error.status).json({ message: error.message });
     }
-    console.error("Checkout error:", error); // server log එකේ full details - client ට generic message එකක් විතරයි
-    res.status(500).json({ message: "Checkout දෝෂයක්! නැවත උත්සාහ කරන්න." });
+    console.error("Checkout error:", error); // full details in the server log - the client only gets a generic message
+    res.status(500).json({ message: "Checkout error! Please try again." });
   } finally {
     await session.endSession();
+  }
+});
+
+// 6.1 🆕 SMART DASHBOARD (Admin) - ?days=7|14|30 (default 14). Today/yesterday, selected period vs the previous equivalent period,
+// daily, by hour, payment methods, Top Products, Cashier Performance, credit/payables (Void bills are excluded from Revenue).
+router.get('/dashboard', requireAdmin, async (req, res) => {
+  try {
+    const days = [7, 14, 30].includes(parseInt(req.query.days, 10)) ? parseInt(req.query.days, 10) : 14;
+    const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+    const ymd = (d) => {
+      const x = new Date(d);
+      return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, '0')}-${String(x.getDate()).padStart(2, '0')}`;
+    };
+
+    const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+    const periodStart = new Date(todayStart); periodStart.setDate(periodStart.getDate() - (days - 1));
+    const prevStart = new Date(periodStart); prevStart.setDate(prevStart.getDate() - days);
+    const now = new Date();
+
+    const sales = await Sale.find({ createdAt: { $gte: prevStart, $lte: now } })
+      .select('cashier totalAmount totalProfit paymentMethod status createdAt items.name items.qty items.price items.costPrice items.returnedQty')
+      .lean();
+
+    const blank = () => ({ revenue: 0, profit: 0, bills: 0 });
+    const periodTotals = blank(), prevTotals = blank(), todayTotals = blank(), yesterdayTotals = blank();
+    const yesterdayStart = new Date(todayStart); yesterdayStart.setDate(yesterdayStart.getDate() - 1);
+
+    const dailyMap = {};
+    const daily = [];
+    for (let i = days - 1; i >= 0; i--) {
+      const d = new Date(todayStart); d.setDate(d.getDate() - i);
+      const key = ymd(d);
+      dailyMap[key] = { date: key, revenue: 0, profit: 0, billCount: 0 };
+      daily.push(dailyMap[key]);
+    }
+    const hourly = Array.from({ length: 24 }, (_, h) => ({ hour: h, revenue: 0, billCount: 0 }));
+    const payMap = {};
+    const productMap = {};
+    const cashierMap = {};
+    const getCashier = (n) => (cashierMap[n || 'Unknown'] ||= { cashier: n || 'Unknown', billCount: 0, totalRevenue: 0, voidCount: 0, returnCount: 0 });
+    let voids = { count: 0, amount: 0 }, returns = { count: 0, amount: 0 };
+
+    const add = (t, rev, prof) => { t.revenue += rev; t.profit += prof; t.bills += 1; };
+
+    for (const sale of sales) {
+      const created = new Date(sale.createdAt);
+      const inPeriod = created >= periodStart;
+
+      if (sale.status === 'Voided') {
+        if (inPeriod) { voids.count += 1; voids.amount += Number(sale.totalAmount) || 0; getCashier(sale.cashier).voidCount += 1; }
+        continue;
+      }
+
+      const { revenue, profit } = saleNetFigures(sale);
+
+      if (!inPeriod) { add(prevTotals, revenue, profit); continue; }
+
+      add(periodTotals, revenue, profit);
+      if (created >= todayStart) add(todayTotals, revenue, profit);
+      else if (created >= yesterdayStart) add(yesterdayTotals, revenue, profit);
+
+      const day = dailyMap[ymd(created)];
+      if (day) { day.revenue += revenue; day.profit += profit; day.billCount += 1; }
+      hourly[created.getHours()].revenue += revenue;
+      hourly[created.getHours()].billCount += 1;
+
+      const pm = (payMap[sale.paymentMethod || 'Cash'] ||= { method: sale.paymentMethod || 'Cash', amount: 0, count: 0 });
+      pm.amount += revenue; pm.count += 1;
+
+      const cp = getCashier(sale.cashier);
+      cp.billCount += 1; cp.totalRevenue += revenue;
+      if (sale.status === 'Returned' || sale.status === 'PartiallyReturned') {
+        cp.returnCount += 1; returns.count += 1;
+        const returnedValue = (sale.items || []).reduce((t, it) => t + (Number(it.price) || 0) * (Number(it.returnedQty) || 0), 0);
+        returns.amount += returnedValue;
+      }
+
+      // Top Products (deducting returned quantities, and accounting for the Bill discount ratio)
+      const gross = (sale.items || []).reduce((t, it) => t + (Number(it.price) || 0) * (Number(it.qty) || 0), 0);
+      const factor = gross > 0 ? (Number(sale.totalAmount) || 0) / gross : 1;
+      for (const it of sale.items || []) {
+        const kept = Math.max(0, (Number(it.qty) || 0) - (Number(it.returnedQty) || 0));
+        if (kept <= 0) continue;
+        const key = (it.name || '').trim() || 'Unknown';
+        const pr = (productMap[key] ||= { name: key, qty: 0, revenue: 0, profit: 0 });
+        const rev = (Number(it.price) || 0) * kept * factor;
+        pr.qty += kept; pr.revenue += rev; pr.profit += rev - (Number(it.costPrice) || 0) * kept;
+      }
+    }
+
+    const fin = (t) => ({
+      revenue: round2(t.revenue), profit: round2(t.profit), bills: t.bills,
+      avgBill: t.bills > 0 ? round2(t.revenue / t.bills) : 0,
+      margin: t.revenue > 0 ? round2((t.profit / t.revenue) * 100) : 0,
+    });
+
+    const customersWithDebt = await Customer.find({ creditBalance: { $gt: 0 } }).select('name phone creditBalance').sort({ creditBalance: -1 }).lean();
+    const suppliersWithDue = await Supplier.find({ balanceDue: { $gt: 0 } }).select('name phone balanceDue').sort({ balanceDue: -1 }).lean();
+
+    res.status(200).json({
+      days,
+      period: fin(periodTotals),
+      previous: fin(prevTotals),
+      today: fin(todayTotals),
+      yesterday: fin(yesterdayTotals),
+      daily: daily.map((d) => ({ ...d, revenue: round2(d.revenue), profit: round2(d.profit) })),
+      hourly: hourly.map((h) => ({ ...h, revenue: round2(h.revenue) })),
+      paymentMix: Object.values(payMap).map((p) => ({ ...p, amount: round2(p.amount) })).sort((a, b) => b.amount - a.amount),
+      topProducts: Object.values(productMap)
+        .map((p) => ({ ...p, qty: round2(p.qty), revenue: round2(p.revenue), profit: round2(p.profit) }))
+        .sort((a, b) => b.revenue - a.revenue).slice(0, 8),
+      cashiers: Object.values(cashierMap)
+        .map((c) => ({ ...c, totalRevenue: round2(c.totalRevenue), avgBillValue: c.billCount > 0 ? round2(c.totalRevenue / c.billCount) : 0 }))
+        .sort((a, b) => b.totalRevenue - a.totalRevenue),
+      voids: { count: voids.count, amount: round2(voids.amount) },
+      returns: { count: returns.count, amount: round2(returns.amount) },
+      credit: {
+        outstanding: round2(customersWithDebt.reduce((t, c) => t + c.creditBalance, 0)),
+        customerCount: customersWithDebt.length,
+        top: customersWithDebt.slice(0, 5).map((c) => ({ name: c.name, phone: c.phone, balance: round2(c.creditBalance) })),
+      },
+      payables: {
+        total: round2(suppliersWithDue.reduce((t, x) => t + x.balanceDue, 0)),
+        supplierCount: suppliersWithDue.length,
+        top: suppliersWithDue.slice(0, 5).map((x) => ({ name: x.name, phone: x.phone, balance: round2(x.balanceDue) })),
+      },
+    });
+  } catch (error) {
+    console.error('Failed to fetch Dashboard data', error);
+    res.status(500).json({ message: 'Failed to fetch Dashboard data' });
   }
 });
 
@@ -420,9 +573,9 @@ router.get('/sales-summary', requireAdmin, async (req, res) => {
     let qrSales = 0;
     let creditSales = 0;
 
-    // 🆕 DASHBOARD: පසුගිය දින 14 (අද ඇතුලත්, පරණ -> අලුත් අනුපිළිවෙලින්) දිනපතා Revenue/Profit/Bills
-    // සහ Cashier අනුව Performance. Voided බිල් Revenue එකට නොගන්නවා (voidCount එකට විතරක් ගනී),
-    // Returned/PartiallyReturned බිල් වල NET (ආපසු දුන්න ප්‍රමාණය අඩු කරපු) අගයම ගනී.
+    // 🆕 DASHBOARD: Daily Revenue/Profit/Bills for the last 14 days (including today, in oldest -> newest order)
+    // and Performance by Cashier. Voided bills are not counted in Revenue (counted only in voidCount),
+    // Returned/PartiallyReturned bills use the NET value (after deducting the returned quantity).
     const ymd = (d) => {
       const x = new Date(d);
       return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, '0')}-${String(x.getDate()).padStart(2, '0')}`;
@@ -455,18 +608,7 @@ router.get('/sales-summary', requireAdmin, async (req, res) => {
       // counts money that was actually given back to the customer. Recompute the NET
       // (what the customer actually kept, after returns) from the line items instead,
       // using each item's own returnedQty — which we already track precisely.
-      let netRevenue = sale.totalAmount;
-      let netProfit = sale.totalProfit;
-
-      if (sale.status === 'Returned' || sale.status === 'PartiallyReturned') {
-        netRevenue = 0;
-        netProfit = 0;
-        for (const item of sale.items) {
-          const keptQty = Math.max(0, item.qty - (item.returnedQty || 0));
-          netRevenue += item.price * keptQty;
-          netProfit += (item.price - item.costPrice) * keptQty;
-        }
-      }
+      const { revenue: netRevenue, profit: netProfit } = saleNetFigures(sale);
 
       totalRevenue += netRevenue;
       totalProfit += netProfit;
@@ -500,35 +642,35 @@ router.get('/sales-summary', requireAdmin, async (req, res) => {
       sales // 🆕 unfiltered list still goes to the frontend — the log view needs Voided/Returned rows for its audit trail
     });
   } catch (error) {
-    console.error("වාර්තා ලබාගැනීම අසාර්ථකයි", error);
-    res.status(500).json({ message: "වාර්තා ලබාගැනීම අසාර්ථකයි" });
+    console.error("Failed to fetch reports", error);
+    res.status(500).json({ message: "Failed to fetch reports" });
   }
 });
 
 // 6.5 🆕 SALES HISTORY - CLEAR ALL (Real-world Pro: Type-to-confirm guard on frontend, hard delete on backend)
-// ⚠️ මේකෙන් Sale records ටික permanently delete වේ - Product Stock/Customer Credit වලට effect කරන්නේ නැත
-// (Stock/Credit දැනටමත් සිදුවූ Transaction එකක ප්‍රතිඵලයක් - History log එක Clear කිරීම ඒවා Undo කරන්නේ නැත)
+// ⚠️ This permanently deletes the Sale records - it does not affect Product Stock/Customer Credit
+// (Stock/Credit are already the result of a completed Transaction - Clearing the History log does not Undo them)
 router.delete('/sales/clear-all', requireAdmin, async (req, res) => {
   try {
     const result = await Sale.deleteMany({});
-    res.status(200).json({ message: `විකුණුම් ඉතිහාසය සම්පූර්ණයෙන් Clear කලා! 🧹 (${result.deletedCount} Records)`, deletedCount: result.deletedCount });
+    res.status(200).json({ message: `Sales history cleared completely! 🧹 (${result.deletedCount} Records)`, deletedCount: result.deletedCount });
   } catch (error) {
-    console.error("Clear කිරීම අසාර්ථකයි", error);
-    res.status(500).json({ message: "Clear කිරීම අසාර්ථකයි" });
+    console.error("Clear failed", error);
+    res.status(500).json({ message: "Clear failed" });
   }
 });
 
 // 7. VOID SALE
 router.post('/void-sale/:id', requireAdmin, async (req, res) => {
-  // 🔐 TRANSACTIONS: Stock restore කරන එකත්, Sale status "Voided" කරන එකත්, Customer credit
-  // adjust කරන එකත් - තුනම එකටම succeed වෙන්න ඕන. මැදදී crash එකක් උනොත් "stock restore වුනා
-  // ඒත් sale තාම Completed" වගේ inconsistent state එකක් හැදෙන්න බෑ.
+  // 🔐 TRANSACTIONS: Restoring Stock, setting the Sale status to "Voided", and adjusting Customer credit -
+  // all three must succeed together. If a crash occurs midway, an inconsistent state such as "stock restored
+  // but the sale still Completed" cannot arise.
   const session = await mongoose.startSession();
   try {
     await session.withTransaction(async () => {
       const sale = await Sale.findById(req.params.id).session(session);
-      if (!sale) throw new RouteError(404, "බිල්පත සොයාගත නොහැක");
-      if (sale.status === 'Voided') throw new RouteError(400, "මෙම බිල්පත දැනටමත් අවලංගු කර ඇත!");
+      if (!sale) throw new RouteError(404, "Bill not found");
+      if (sale.status === 'Voided') throw new RouteError(400, "This bill has already been voided!");
 
       for (const item of sale.items) {
         const notReturnedQty = item.qty - (item.returnedQty || 0);
@@ -541,7 +683,7 @@ router.post('/void-sale/:id', requireAdmin, async (req, res) => {
             filter["batches.batchId"] = item.batchId;
             inc["batches.$.stock"] = notReturnedQty;
           }
-          // batchId match නොවුනත් (e.g. batch පස්සේ delete වුනා) අවම වශයෙන් top-level stock එක restore කරයි
+          // Even if batchId does not match (e.g. the batch was deleted later), at least restores the top-level stock
           const updated = await Product.findOneAndUpdate(filter, { $inc: inc }, { session, new: true });
           if (!updated && item.batchId) {
             await Product.findByIdAndUpdate(item.productId, { $inc: { stock: notReturnedQty } }, { session });
@@ -560,13 +702,13 @@ router.post('/void-sale/:id', requireAdmin, async (req, res) => {
       await sale.save({ session });
     });
 
-    res.status(200).json({ message: "බිල්පත සාර්ථකව අවලංගු කලා සහ තොග නැවත එකතු කලා! 🔄" });
+    res.status(200).json({ message: "Bill voided successfully and stock restored! 🔄" });
   } catch (error) {
     if (error instanceof RouteError) {
       return res.status(error.status).json({ message: error.message });
     }
     console.error("Void sale error:", error);
-    res.status(500).json({ message: "අවලංගු කිරීම අසාර්ථකයි" });
+    res.status(500).json({ message: "Void failed" });
   } finally {
     await session.endSession();
   }
@@ -583,32 +725,32 @@ router.get('/invoice/:id', async (req, res) => {
     }
 
     if (!sale) {
-      return res.status(404).json({ message: "මෙම බිල්පත් අංකය සොයාගත නොහැක! ❌" });
+      return res.status(404).json({ message: "This bill number was not found! ❌" });
     }
     res.status(200).json(sale);
   } catch (error) {
-    res.status(500).json({ message: "දත්ත සෙවීමේදී දෝෂයක් ඇති විය!" });
+    res.status(500).json({ message: "An error occurred while searching for data!" });
   }
 });
 
 // 9. RETURN / REFUND
-router.post('/return', async (req, res) => {
+router.post('/return', requireOpenShift(), async (req, res) => {
   const { saleId, cashierName, refundMethod, items } = req.body;
   if (!saleId || !Array.isArray(items) || items.length === 0) {
-    return res.status(400).json({ message: "අවම වශයෙන් Return කරන භාණ්ඩයක් තෝරන්න!" });
+    return res.status(400).json({ message: "Please select at least one item to Return!" });
   }
 
-  // 🔐 TRANSACTIONS: Sale update + Stock restore + Customer credit + Return record - සියල්ලම
-  // එකම atomic unit එකක්. අතරමැද error එකක් උනොත් "refund logged ඒත් stock restore වුනේ නෑ"
-  // වගේ account/stock mismatch එකක් හැදෙන්න බෑ.
+  // 🔐 TRANSACTIONS: Sale update + Stock restore + Customer credit + Return record - all in
+  // one atomic unit. If an error occurs midway, an account/stock mismatch such as "refund logged
+  // but stock not restored" cannot arise.
   const session = await mongoose.startSession();
   let responsePayload = null;
 
   try {
     await session.withTransaction(async () => {
       const sale = await Sale.findById(saleId).session(session);
-      if (!sale) throw new RouteError(404, "බිල සොයාගත නොහැක!");
-      if (sale.status === 'Voided') throw new RouteError(400, "අවලංගු කරන ලද බිලකට Return කළ නොහැක!");
+      if (!sale) throw new RouteError(404, "Bill not found!");
+      if (sale.status === 'Voided') throw new RouteError(400, "A Return cannot be made on a voided bill!");
 
       let totalRefundAmount = 0;
       const returnedItemsLog = [];
@@ -624,13 +766,13 @@ router.post('/return', async (req, res) => {
         const availableToReturn = saleItem.qty - alreadyReturned;
 
         if (returnQty > availableToReturn) {
-          throw new RouteError(400, `"${saleItem.name}" සඳහා Return කළ හැක්කේ ${availableToReturn} පමණි!`);
+          throw new RouteError(400, `Only ${availableToReturn} of "${saleItem.name}" can be Returned!`);
         }
 
         const refundAmount = saleItem.price * returnQty;
         totalRefundAmount += refundAmount;
 
-        // Stock සහ Batch Stock නැවත එකතු කිරීම (atomic $inc - race-safe)
+        // Restore Stock and Batch Stock (atomic $inc - race-safe)
         if (saleItem.productId) {
           const filter = { _id: saleItem.productId };
           const inc = { stock: returnQty };
@@ -649,16 +791,16 @@ router.post('/return', async (req, res) => {
           name: saleItem.name,
           qty: returnQty,
           refundAmount,
-          reason: reqItem.reason || "සඳහන් කර නැත"
+          reason: reqItem.reason || "Not specified"
         });
       }
 
-      if (totalRefundAmount <= 0) throw new RouteError(400, "වලංගු Return ප්‍රමාණයක් හමු නොවුනි!");
+      if (totalRefundAmount <= 0) throw new RouteError(400, "No valid Return quantity found!");
 
-      // 🆕 CREDIT බිලක් Cash/Card වලින් Refund කරද්දී, පාරිභෝගිකයා ඇත්තටම ගෙවපු කොටසට (amountPaid) වඩා
-      // වැඩියෙන් Cash/Card ආපසු දෙන්න බෑ - ණයට ගත්ත කොටසට අදාල Refund එක "ණය පොතෙන් අඩු කිරීම"
-      // (CreditAdjust) වලින් විතරයි කරන්න ඕන, නැත්නම් drawer එකෙන් ඇත්තටම නොලැබුණු මුදලක් ආපසු දෙනවා.
-      // කලින් මේ බිලට Cash/Card Refund කරපු මුදල Return records වලින්ම අරගෙන ඉතිරි ප්‍රමාණය බලයි.
+      // 🆕 When refunding a CREDIT bill via Cash/Card, no more Cash/Card can be returned than the portion the
+      // customer actually paid (amountPaid) - the Refund for the portion bought on credit must only be made
+      // via "Deduct from credit ledger" (CreditAdjust); otherwise money that was never actually received in the drawer would be handed back.
+      // The amount already refunded by Cash/Card on this bill is taken from the Return records themselves to work out the remainder.
       if (sale.paymentMethod === 'Credit' && (refundMethod === 'Cash' || refundMethod === 'Card' || !refundMethod)) {
         const priorCashAgg = await Return.aggregate([
           { $match: { saleId: sale._id, refundMethod: { $in: ['Cash', 'Card'] } } },
@@ -669,14 +811,14 @@ router.post('/return', async (req, res) => {
         if (totalRefundAmount > maxCashRefund + 0.004) {
           throw new RouteError(
             400,
-            `මෙම ණය බිලේ Cash/Card වලින් Refund කළ හැක්කේ උපරිම රු.${maxCashRefund.toFixed(2)} ක් පමණි (පාරිභෝගිකයා ගෙවූ කොටස). ඉතිරි මුදල "ණය පොතෙන් අඩු කිරීම" ලෙස Refund කරන්න.`
+            `On this credit bill, a maximum of Rs.${maxCashRefund.toFixed(2)} can be refunded by Cash/Card (the portion paid by the customer). Please refund the remaining amount as "Deduct from credit ledger".`
           );
         }
       }
 
-      // 🛠️ FIX: කලින් Credit බිලක් Cash වලින් Refund කළත් sale.amountDue අඩු වුනා, ඒත් Customer ගේ
-      // creditBalance අඩු වුනේ නෑ (බිල පෙන්නපු ණයයි ණය පොතයි ගැලපුනේ නෑ). දැන් amountDue අඩු වෙන්නේ
-      // ණය පොතෙනුත් ඇත්තටම අඩු කරද්දී (CreditAdjust/StoreCredit) විතරයි - දෙකම හැමවෙලේම එකට වෙනස් වේ.
+      // 🛠️ FIX: Previously, when a Credit bill was refunded by Cash, sale.amountDue was reduced but the Customer's
+      // creditBalance was not (the credit shown on the bill and the credit ledger did not match). Now amountDue is reduced only
+      // when the credit ledger is also actually reduced (CreditAdjust/StoreCredit) - the two always change together.
       let creditAdjusted = false;
       if ((refundMethod === 'StoreCredit' || refundMethod === 'CreditAdjust') && sale.customerId) {
         const customer = await Customer.findById(sale.customerId).session(session);
@@ -714,7 +856,7 @@ router.post('/return', async (req, res) => {
       await returnRecord.save({ session });
 
       responsePayload = {
-        message: `Return එක සාර්ථකයි! ✅ Refund: රු.${totalRefundAmount.toFixed(2)}`,
+        message: `Return completed successfully! ✅ Refund: Rs.${totalRefundAmount.toFixed(2)}`,
         totalRefundAmount,
         saleStatus: sale.status
       };
@@ -726,25 +868,25 @@ router.post('/return', async (req, res) => {
       return res.status(error.status).json({ message: error.message });
     }
     console.error("Return error:", error);
-    res.status(500).json({ message: "Return ක්‍රියාවලිය අසාර්ථකයි!" });
+    res.status(500).json({ message: "Return process failed!" });
   } finally {
     await session.endSession();
   }
 });
 
 // 10. EXCHANGE
-router.post('/exchange', async (req, res) => {
+router.post('/exchange', requireOpenShift(), async (req, res) => {
   const { saleId, cashierName, refundMethod, returnItems, newItems, extraPaymentMethod, extraCashReceived } = req.body;
 
   // 🔐 TRANSACTIONS: Old sale update + stock restore (returned items) + stock decrement (new
-  // items) + new Sale creation - සියල්ලම එකම atomic unit එකක්.
+  // items) + new Sale creation - all in a single atomic unit.
   const session = await mongoose.startSession();
   let responsePayload = null;
 
   try {
     await session.withTransaction(async () => {
       const sale = await Sale.findById(saleId).session(session);
-      if (!sale) throw new RouteError(404, "පැරණි බිල සොයාගත නොහැක!");
+      if (!sale) throw new RouteError(404, "Original bill not found!");
 
       let totalRefundAmount = 0;
       const returnedItemsLog = [];
@@ -777,12 +919,12 @@ router.post('/exchange', async (req, res) => {
         returnedItemsLog.push({ name: saleItem.name, qty: returnQty, refundAmount, reason: reqItem.reason || "Exchange" });
       }
 
-      // 🔐 PASS 1 (new items): කලින් checkout එකේ කලානම් ම, exchange එකේ අරගන්න අලුත් items
-      // වලත් price එකත් stock එකත් DB එකට සාපේක්ෂව validate කරයි - client එකේ price එක විශ්වාස කරන්නේ නෑ.
+      // 🔐 PASS 1 (new items): As in the earlier checkout, the price and stock of the new items
+      // taken in the exchange are validated against the DB - the client's price is not trusted.
       const resolvedNewItems = [];
       for (const item of newItems) {
         const qty = parseFloat(item.qty);
-        if (!qty || qty <= 0) throw new RouteError(400, `"${item.name}" සඳහා නිවැරදි ප්‍රමාණයක් නැත!`);
+        if (!qty || qty <= 0) throw new RouteError(400, `Invalid quantity for "${item.name}"!`);
 
         if (!item._id) {
           resolvedNewItems.push({ item, qty, product: null, batch: null, canonical: null });
@@ -790,7 +932,7 @@ router.post('/exchange', async (req, res) => {
         }
 
         const product = await Product.findById(item._id).session(session);
-        if (!product) throw new RouteError(404, `"${item.name}" භාණ්ඩය සොයාගත නොහැක!`);
+        if (!product) throw new RouteError(404, `Item "${item.name}" not found!`);
 
         let batch = null;
         if (item.batchId && Array.isArray(product.batches) && product.batches.length > 0) {
@@ -806,10 +948,10 @@ router.post('/exchange', async (req, res) => {
         };
 
         if (Math.abs(parseFloat(item.price) - canonical.price) > PRICE_TOLERANCE) {
-          throw new RouteError(409, `"${item.name}" හි මිල වෙනස් වී ඇත! නැවත උත්සාහ කරන්න.`);
+          throw new RouteError(409, `The price of "${item.name}" has changed! Please try again.`);
         }
         if (qty > canonical.stock + 0.001) {
-          throw new RouteError(400, `"${item.name}" සඳහා ප්‍රමාණවත් තොගයක් නැත! (ඇත්තේ: ${canonical.stock})`);
+          throw new RouteError(400, `Insufficient stock for "${item.name}"! (Available: ${canonical.stock})`);
         }
 
         resolvedNewItems.push({ item, qty, product, batch, canonical });
@@ -843,7 +985,7 @@ router.post('/exchange', async (req, res) => {
         }
         const updatedProduct = await Product.findOneAndUpdate(filter, { $inc: inc }, { session, new: true });
         if (!updatedProduct) {
-          throw new RouteError(409, `"${item.name}" හි තොගය දැන් වෙනස් වී ඇත! නැවත උත්සාහ කරන්න.`);
+          throw new RouteError(409, `The stock of "${item.name}" has just changed! Please try again.`);
         }
 
         const itemTotal = canonical.price * qty;
@@ -881,13 +1023,13 @@ router.post('/exchange', async (req, res) => {
       });
       await newSale.save({ session });
 
-      // 🆕 BONUS FIX: Sale schema එකේම තිබ්බ `linkedExchangeSaleId` field එක කලින් කවදාවත්
-      // set කලේ නෑ - පරණ බිල එකෙන් අලුත් Exchange බිලට navigate වෙන්න බෑ තිබුණේ. දැන් link කරයි.
+      // 🆕 BONUS FIX: The `linkedExchangeSaleId` field that already existed in the Sale schema was never
+      // set before - so it was not possible to navigate from the old bill to the new Exchange bill. Now it is linked.
       sale.linkedExchangeSaleId = newSale._id;
       await sale.save({ session });
 
       responsePayload = {
-        message: "Exchange එක සාර්ථකයි! ✅",
+        message: "Exchange completed successfully! ✅",
         exchangeDifference,
         newSaleId: newSale._id,
         totalRefundAmount,
@@ -901,7 +1043,7 @@ router.post('/exchange', async (req, res) => {
       return res.status(error.status).json({ message: error.message });
     }
     console.error("Exchange error:", error);
-    res.status(500).json({ message: "Exchange අසාර්ථකයි!" });
+    res.status(500).json({ message: "Exchange failed!" });
   } finally {
     await session.endSession();
   }
@@ -913,20 +1055,20 @@ router.get('/returns', requireAdmin, async (req, res) => {
     const returns = await Return.find().sort({ createdAt: -1 }).populate('customerId');
     res.status(200).json(returns);
   } catch (error) {
-    console.error("Return ඉතිහාසය ලබාගැනීම අසාර්ථකයි", error);
-    res.status(500).json({ message: "Return ඉතිහාසය ලබාගැනීම අසාර්ථකයි" });
+    console.error("Failed to fetch Return history", error);
+    res.status(500).json({ message: "Failed to fetch Return history" });
   }
 });
 
 // 12. 🆕 RETURN/EXCHANGE HISTORY - CLEAR ALL
-// ⚠️ මේකෙන් Return log entries ටික permanently delete වේ - Sale document එකේ තියෙන returnedQty/status වලට effect කරන්නේ නැත
+// ⚠️ This permanently deletes the Return log entries - it does not affect the returnedQty/status in the Sale document
 router.delete('/returns/clear-all', requireAdmin, async (req, res) => {
   try {
     const result = await Return.deleteMany({});
-    res.status(200).json({ message: `Return/Exchange ඉතිහාසය සම්පූර්ණයෙන් Clear කලා! 🧹 (${result.deletedCount} Records)`, deletedCount: result.deletedCount });
+    res.status(200).json({ message: `Return/Exchange history cleared completely! 🧹 (${result.deletedCount} Records)`, deletedCount: result.deletedCount });
   } catch (error) {
-    console.error("Clear කිරීම අසාර්ථකයි", error);
-    res.status(500).json({ message: "Clear කිරීම අසාර්ථකයි" });
+    console.error("Clear failed", error);
+    res.status(500).json({ message: "Clear failed" });
   }
 });
 
