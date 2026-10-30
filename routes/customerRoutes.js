@@ -145,7 +145,7 @@ router.post('/pay-credit/:id', requireOpenShift({ onlyIfCash: true }), async (re
             // 🆕 FIX: A "payment" cannot be recorded for a customer with no credit - just like balanceDue,
             // there is something to settle only if creditBalance is greater than 0.
             if (owedBefore <= 0) {
-                throw new RouteError(400, "This customer has no outstanding credit to pay! No payment is required.");
+                throw new routeError(400, "This customer has no outstanding credit to pay! No payment is required.");
             }
 
             // Only up to the remaining credit amount of the paid amount is actually applied to creditBalance
