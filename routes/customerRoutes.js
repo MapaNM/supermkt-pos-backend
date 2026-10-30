@@ -1,7 +1,7 @@
 const express = require('express');
 const mongoose = require('mongoose'); // 🔐 needed for session/transaction support
 const router = express.Router();
-const RouteError = require('../utils/routeError');
+const RouteError = require('../utils/RouteError');
 const Customer = require('../models/Customer');
 const { requireOpenShift } = require('../middleware/requireShift'); // 🔐 Make Shift mandatory (for Cash payments)
 const { requireAdmin } = require('../middleware/auth'); // 🔐 note: `protect` already applied at /api/customers in server.js
