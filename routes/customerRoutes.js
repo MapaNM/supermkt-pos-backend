@@ -1,32 +1,33 @@
 const express = require('express');
 const mongoose = require('mongoose'); // 🔐 needed for session/transaction support
 const router = express.Router();
-const RouteError = require('../utils/RouteError');
+const RouteError = require('../utils/routeError');
 const Customer = require('../models/Customer');
+const { requireOpenShift } = require('../middleware/requireShift'); // 🔐 Make Shift mandatory (for Cash payments)
 const { requireAdmin } = require('../middleware/auth'); // 🔐 note: `protect` already applied at /api/customers in server.js
 
-// 1. අලුත් පාරිභෝගිකයෙක් ඇතුලත් කිරීම
+// 1. Add a new customer
 router.post('/add', async (req, res) => {
     try {
         const { name, phone, isLoyaltyMember } = req.body;
         const existing = await Customer.findOne({ phone });
-        if (existing) return res.status(400).json({ message: "මෙම දුරකථන අංකය දැනටමත් පද්ධතියේ ඇත! ❌" });
+        if (existing) return res.status(400).json({ message: "This phone number already exists in the system! ❌" });
 
-        // 🆕 BILL-LEVEL DISCOUNT: Loyalty Card Holder flag එකත් සේව් කරයි
+        // 🆕 BILL-LEVEL DISCOUNT: Also saves the Loyalty Card Holder flag
         const newCustomer = new Customer({ name, phone, isLoyaltyMember: isLoyaltyMember || false });
         await newCustomer.save();
-        res.status(201).json({ message: "පාරිභෝගිකයා සාර්ථකව ඇතුලත් කලා! 👤", customer: newCustomer });
+        res.status(201).json({ message: "Customer added successfully! 👤", customer: newCustomer });
     } catch (error) {
-        console.error("ඇතුලත් කිරීම අසාර්ථකයි", error);
-        res.status(500).json({ message: "ඇතුලත් කිරීම අසාර්ථකයි" });
+        console.error("Failed to add customer", error);
+        res.status(500).json({ message: "Failed to add customer" });
     }
 });
 
-// 🛠️ UPDATED: පාරිභෝගික විස්තර යාවත්කාලීන කිරීමේ Route එක
-// 🔐 SECURITY FIX: කලින් req.body එකම whole එකක් විදිහට DB update එකට දැම්මා (Mass-Assignment Vulnerability) -
-// Edit Form එකෙන් name/phone විතරක් එවුවත්, request body එකට extra field එකක් (උදා: creditBalance,
-// creditHistory) එකතු කරලා එව්වොත් ඒකත් update වෙනවා. දැන් Edit Form එකෙන් ඇත්තටම එවන fields
-// (name, phone) විතරක් allow-list කරලා, ඒවා විතරක් DB එකට යවනවා.
+// 🛠️ UPDATED: Route to update customer details
+// 🔐 SECURITY FIX: Previously the whole req.body was passed into the DB update (Mass-Assignment Vulnerability) -
+// even if the Edit Form only sends name/phone, if an extra field (e.g. creditBalance,
+// creditHistory) was added to the request body, it would also get updated. Now only the fields the Edit Form
+// actually sends (name, phone) are allow-listed, and only those are sent to the DB.
 router.put("/update/:id", requireAdmin, async (req, res) => {
   try {
     const { name, phone } = req.body;
@@ -35,34 +36,34 @@ router.put("/update/:id", requireAdmin, async (req, res) => {
     if (phone !== undefined) updateFields.phone = phone;
 
     const updatedCustomer = await Customer.findByIdAndUpdate(
-      req.params.id, // Frontend එකෙන් එන ID එක මෙතනින් ලබාගනී
+      req.params.id, // The ID coming from the Frontend is taken here
       updateFields,
       { returnDocument: 'after', runValidators: true }
     );
 
     if (!updatedCustomer) {
-      return res.status(404).json({ message: "පාරිභෝගිකයා සොයාගත නොහැක" });
+      return res.status(404).json({ message: "Customer not found" });
     }
 
-    res.json({ message: "විස්තර යාවත්කාලීන කිරීම සාර්ථකයි! 🔄", customer: updatedCustomer });
+    res.json({ message: "Details updated successfully! 🔄", customer: updatedCustomer });
   } catch (error) {
-    console.error("යාවත්කාලීන කිරීම අසාර්ථකයි", error);
-    res.status(500).json({ message: "යාවත්කාලීන කිරීම අසාර්ථකයි" });
+    console.error("Failed to update", error);
+    res.status(500).json({ message: "Failed to update" });
   }
 });
 
-// 2. සියලුම පාරිභෝගිකයන් ලබාගැනීම
+// 2. Get all customers
 router.get('/', async (req, res) => {
     try {
         const customers = await Customer.find().sort({ name: 1 });
         res.status(200).json(customers);
     } catch (error) {
-        console.error("දත්ත ලබාගැනීම අසාර්ථකයි", error);
-        res.status(500).json({ message: "දත්ත ලබාගැනීම අසාර්ථකයි" });
+        console.error("Failed to fetch data", error);
+        res.status(500).json({ message: "Failed to fetch data" });
     }
 });
 
-// 3. පාරිභෝගිකයෙකු දුරකථන අංකයෙන් සෙවීම
+// 3. Search for a customer by phone number
 // 🔍 🛠️ UPDATED: SEARCH CUSTOMER BY NAME OR PHONE
 // customerRoutes.js
 function escapeRegex(text) {
@@ -88,45 +89,45 @@ router.get("/search/:query", async (req, res) => {
 
     res.json(customers);
   } catch (error) {
-    console.error("සෙවීම අසාර්ථකයි", error);
-    res.status(500).json({ message: "සෙවීම අසාර්ථකයි" });
+    console.error("Failed to search", error);
+    res.status(500).json({ message: "Failed to search" });
   }
 });
 
-// 🛠️ UPDATED: පාරිභෝගිකයෙකු මකා දැමීමේ Route එක
+// 🛠️ UPDATED: Route to delete a customer
 router.delete("/delete/:id", requireAdmin, async (req, res) => {
   try {
     const deletedCustomer = await Customer.findByIdAndDelete(req.params.id);
 
     if (!deletedCustomer) {
-      return res.status(404).json({ message: "පාරිභෝගිකයා සොයාගත නොහැක" });
+      return res.status(404).json({ message: "Customer not found" });
     }
 
-    res.json({ message: "මකා දැමීම සාර්ථකයි! 🗑️" });
+    res.json({ message: "Deleted successfully! 🗑️" });
   } catch (error) {
-    console.error("මකා දැමීම අසාර්ථකයි", error);
-    res.status(500).json({ message: "මකා දැමීම අසාර්ථකයි" });
+    console.error("Failed to delete", error);
+    res.status(500).json({ message: "Failed to delete" });
   }
 });
 
-// 4. ණය මුදල් පියවීම (Pay/Settle Credit)
-// 🛠️ REWRITE (2026-10-16): පරණ කේතය creditHistory එකට entries 2ක් (payment + "isChangeReturn"
-// කියන වෙනම entry එකක්) හදනවා තිබුණා, ඒත් "isChangeReturn" field එක Customer.js schema එකේ
-// කවදාවත් define කරලා තිබුනේ නෑ - Mongoose strict-schema නිසා save කරද්දී ඒ field එකම silently
-// drop වුනා. ප්‍රතිඵලය: Overpayment එකක් උනත්, cashback එක UI එකේ (orange badge/summary) කවදාවත්
-// පේන්නේ නෑ, response එකේ changeGiven නැති නිසා toast එකත් වැරදියට "success" විදිහටම පෙන්වුනා.
+// 4. Settle credit (Pay/Settle Credit)
+// 🛠️ REWRITE (2026-10-16): The old code created 2 entries in creditHistory (a payment + a separate entry called "isChangeReturn"),
+// but the "isChangeReturn" field was
+// never defined in the Customer.js schema - because of Mongoose strict-schema, that field was silently
+// dropped on save. Result: even when there was an Overpayment, the cashback was never shown in the UI (orange badge/summary),
+// and since changeGiven was missing from the response, the toast also wrongly showed as plain "success".
 //
-// දැන් Supplier payment route එකේම (/suppliers/pay/:id, දැනටමත් හරියට වැඩ කරන) pattern එකම -
-// Single ledger entry එකක් (amount = applied-to-debt විතරක්, paidAmount/changeGiven වෙනම
-// fields වලින්), Customer.js schema එකේ දැනටමත් define කරලා තියෙන paidAmount/changeGiven fields
-// පාවිච්චි කරලා, Transaction එකකින් wrap කරලා (concurrent payments අතරේ lost-update race එකකින්
-// ආරක්ෂා වෙන්න). Shift Reconciliation සඳහා එකතු කරපු Payment Method/Cashier tracking එකත්
-// මෙතනටම (single entry එකටම) ගේනවා - Customer.js schema එකටත් ඒ fields දැන් එකතු කරලා තියෙනවා.
-router.post('/pay-credit/:id', async (req, res) => {
+// Now using the very same pattern as the Supplier payment route (/suppliers/pay/:id, which already works correctly) -
+// a single ledger entry (amount = only the amount applied to the debt, with paidAmount/changeGiven in separate
+// fields), using the paidAmount/changeGiven fields already defined in the Customer.js schema,
+// wrapped in a Transaction (to protect against lost-update races between concurrent payments).
+// The Payment Method/Cashier tracking added for Shift Reconciliation is also brought
+// into this same single entry - those fields have now been added to the Customer.js schema as well.
+router.post('/pay-credit/:id', requireOpenShift({ onlyIfCash: true }), async (req, res) => {
     const { amount, paymentMethod } = req.body;
     const paidAmount = Number(amount);
     if (!paidAmount || paidAmount <= 0) {
-        return res.status(400).json({ message: "නිවැරදි මුදලක් ඇතුලත් කරන්න!" });
+        return res.status(400).json({ message: "Please enter a valid amount!" });
     }
     const validMethods = ["Cash", "Card", "Bank Transfer", "Other"];
     const method = validMethods.includes(paymentMethod) ? paymentMethod : "Cash";
@@ -137,25 +138,25 @@ router.post('/pay-credit/:id', async (req, res) => {
     try {
         await session.withTransaction(async () => {
             const customer = await Customer.findById(req.params.id).session(session);
-            if (!customer) throw new RouteError(404, "පාරිභෝගිකයා සොයාගත නොහැක");
+            if (!customer) throw new RouteError(404, "Customer not found");
 
             const owedBefore = customer.creditBalance || 0;
 
-            // 🆕 FIX: ණයක් නැති customer කෙනෙකුට "ගෙවීමක්" record කරන්න බෑ - balanceDue වගේම,
-            // creditBalance 0ට වඩා තිබුනොත් විතරයි settle කරන්න ඕන දෙයක් තියෙන්නේ.
+            // 🆕 FIX: A "payment" cannot be recorded for a customer with no credit - just like balanceDue,
+            // there is something to settle only if creditBalance is greater than 0.
             if (owedBefore <= 0) {
-                throw new RouteError(400, "මෙම පාරිභෝගිකයාට ගෙවීමට ඇති ණයක් නැත! ගෙවීමක් අවශ්‍ය නොවේ.");
+                throw new RouteError(400, "This customer has no outstanding credit to pay! No payment is required.");
             }
 
-            // creditBalance එකට ඇත්තටම යෙදෙන්නේ, ගෙවපු මුදලෙන් ණයට ඉතිරිව තියෙන ප්‍රමාණය දක්වා විතරයි
+            // Only up to the remaining credit amount of the paid amount is actually applied to creditBalance
             const appliedAmount = Math.round(Math.min(paidAmount, owedBefore) * 100) / 100;
-            // ඉතුරු (ණයට වඩා ගෙවපු) මුදල - ආපසු ලැබෙන්න ඕන "cashback" එක
+            // The remainder (the amount paid over the credit) - the "cashback" that must be returned
             const changeGiven = Math.round((paidAmount - appliedAmount) * 100) / 100;
 
             customer.creditBalance = Math.max(0, Math.round((owedBefore - appliedAmount) * 100) / 100);
 
-            // (Cash Drawer එකට ගැලපෙන්නේ මේ "appliedAmount" එකමයි - paidAmount - changeGiven = appliedAmount,
-            // ඒ නිසා Shift aggregation එකේදී මේ එක entry එකේ amount එක ගත්තොත් ප්‍රමාණවත්.)
+            // (This "appliedAmount" is what matches the Cash Drawer - paidAmount - changeGiven = appliedAmount,
+            // so taking the amount of this single entry in the Shift aggregation is sufficient.)
             if (!customer.creditHistory) customer.creditHistory = [];
             customer.creditHistory.push({
                 amount: -appliedAmount,
@@ -165,16 +166,16 @@ router.post('/pay-credit/:id', async (req, res) => {
                 paymentMethod: method,
                 date: new Date(),
                 description: changeGiven > 0
-                    ? `ණය මුදල් ගෙවීමක් සිදු කලා (ගෙවූ මුදල: රු.${paidAmount.toFixed(2)}, ණයට යෙදුවේ: රු.${appliedAmount.toFixed(2)}, ආපසු ලැබුණු මුදල: රු.${changeGiven.toFixed(2)}) - ${method}`
-                    : `ණය මුදල් ගෙවීමක් සිදු කලා (Payment Received) - ${method}`
+                    ? `Credit payment made (Amount paid: Rs.${paidAmount.toFixed(2)}, Applied to credit: Rs.${appliedAmount.toFixed(2)}, Change returned: Rs.${changeGiven.toFixed(2)}) - ${method}`
+                    : `Credit payment made (Payment Received) - ${method}`
             });
 
             await customer.save({ session });
 
             responsePayload = {
                 message: changeGiven > 0
-                    ? `ණය මුදල සාර්ථකව යාවත්කාලීන කලා! 💵 ආපසු ලැබෙන්න ඕන මුදල: රු.${changeGiven.toFixed(2)}`
-                    : "ණය මුදල සාර්ථකව යාවත්කාලීන කලා! ✅",
+                    ? `Credit updated successfully! 💵 Change to be returned: Rs.${changeGiven.toFixed(2)}`
+                    : "Credit updated successfully! ✅",
                 customer,
                 appliedAmount,
                 changeGiven
@@ -186,8 +187,8 @@ router.post('/pay-credit/:id', async (req, res) => {
         if (error instanceof RouteError) {
             return res.status(error.status).json({ message: error.message });
         }
-        console.error("පියවීම අසාර්ථකයි", error);
-        res.status(500).json({ message: "පියවීම අසාර්ථකයි" });
+        console.error("Failed to settle", error);
+        res.status(500).json({ message: "Failed to settle" });
     } finally {
         await session.endSession();
     }
