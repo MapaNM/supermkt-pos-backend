@@ -1,15 +1,16 @@
 const express = require("express");
 const mongoose = require("mongoose"); // 🔐 needed for session/transaction support
 const router = express.Router();
-const RouteError = require("../utils/RouteError");
+const RouteError = require("../utils/routeError");
 const Supplier = require("../models/Supplier");
 const Product = require("../models/Product");
+const { requireOpenShift } = require("../middleware/requireShift"); // 🔐 Make Shift mandatory (for Cash payments)
 const GRN = require("../models/GRN"); // 🆕 Professional GRN document
 const Counter = require("../models/Counter"); // 🆕 Sequential GRN numbering (same pattern as Invoice No)
 // 🔐 note: this entire router is mounted behind `protect` + `requireAdmin` in server.js —
 // supplier management (purchases, balances, payments) is admin-only, no per-route changes needed here.
 
-// Regex special characters escape කිරීම (Regex Injection වළක්වන්න)
+// Escape Regex special characters (to prevent Regex Injection)
 function escapeRegex(text) {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -17,8 +18,8 @@ function escapeRegex(text) {
 const roundQty = (num) => Math.round((parseFloat(num) || 0) * 1000) / 1000;
 const round2 = (num) => Math.round((parseFloat(num) || 0) * 100) / 100;
 
-// 🆕 PROFESSIONAL SEQUENTIAL GRN NUMBER GENERATOR - Invoice No එකේම pattern එක
-// GRN-20260101-0001 වගේ, දවසකට 0001 ඉඳන් restart වෙනවා (Real GRN Document Style)
+// 🆕 PROFESSIONAL SEQUENTIAL GRN NUMBER GENERATOR - Same pattern as the Invoice No
+// like GRN-20260101-0001, restarting from 0001 each day (Real GRN Document Style)
 async function generateGrnNo(session = null) {
   const now = new Date();
   const dateStr = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}`;
@@ -33,37 +34,37 @@ async function generateGrnNo(session = null) {
   return `GRN-${dateStr}-${String(counter.seq).padStart(4, "0")}`;
 }
 
-// 1. අලුත් Supplier කෙනෙක් ඇතුලත් කිරීම
+// 1. Add a new Supplier
 router.post("/add", async (req, res) => {
   try {
     const { name, phone, address } = req.body;
 
     const existing = await Supplier.findOne({ phone });
     if (existing) {
-      return res.status(400).json({ message: "මෙම දුරකථන අංකය දැනටමත් Supplier කෙනෙක් සතුව ඇත! ❌" });
+      return res.status(400).json({ message: "This phone number already belongs to another Supplier! ❌" });
     }
 
     const newSupplier = new Supplier({ name, phone, address });
     await newSupplier.save();
-    res.status(201).json({ message: "සැපයුම්කරු සාර්ථකව ඇතුලත් කලා! 🚚", supplier: newSupplier });
+    res.status(201).json({ message: "Supplier added successfully! 🚚", supplier: newSupplier });
   } catch (error) {
-    console.error("ඇතුලත් කිරීම අසාර්ථකයි", error);
-    res.status(500).json({ message: "ඇතුලත් කිරීම අසාර්ථකයි" });
+    console.error("Failed to add supplier", error);
+    res.status(500).json({ message: "Failed to add supplier" });
   }
 });
 
-// 2. සියලුම Suppliers ලබාගැනීම
+// 2. Get all Suppliers
 router.get("/", async (req, res) => {
   try {
     const suppliers = await Supplier.find().sort({ name: 1 });
     res.status(200).json(suppliers);
   } catch (error) {
-    console.error("දත්ත ලබාගැනීම අසාර්ථකයි", error);
-    res.status(500).json({ message: "දත්ත ලබාගැනීම අසාර්ථකයි" });
+    console.error("Failed to fetch data", error);
+    res.status(500).json({ message: "Failed to fetch data" });
   }
 });
 
-// 3. Supplier කෙනෙක් නමින් හෝ දුරකථන අංකයෙන් සෙවීම (Live Search)
+// 3. Search for a Supplier by name or phone number (Live Search)
 router.get("/search/:query", async (req, res) => {
   try {
     const { query } = req.params;
@@ -79,17 +80,17 @@ router.get("/search/:query", async (req, res) => {
 
     res.json(suppliers);
   } catch (error) {
-    console.error("සෙවීම අසාර්ථකයි", error);
-    res.status(500).json({ message: "සෙවීම අසාර්ථකයි" });
+    console.error("Failed to search", error);
+    res.status(500).json({ message: "Failed to search" });
   }
 });
 
-// 4. Supplier විස්තර යාවත්කාලීන කිරීම
-// 🔐 SECURITY FIX: කලින් req.body එකම whole එකක් විදිහට DB update එකට දැම්මා (Mass-Assignment Vulnerability) -
-// Edit Form එකෙන් name/phone/address විතරක් එවුවත්, request body එකට extra field එකක් (උදා:
-// balanceDue, ledger) එකතු කරලා එව්වොත් ඒකත් update වෙනවා - ගිණුම් වාර්තා (financial records)
-// direct API call එකකින් silently overwrite වෙන්න පුළුවන් කියන එක. දැන් Edit Form එකෙන් ඇත්තටම
-// එවන fields (name, phone, address) විතරක් allow-list කරලා, ඒවා විතරක් DB එකට යවනවා.
+// 4. Update Supplier details
+// 🔐 SECURITY FIX: Previously the whole req.body was passed into the DB update (Mass-Assignment Vulnerability) -
+// even if the Edit Form only sends name/phone/address, if an extra field (e.g.
+// balanceDue, ledger) was added to the request body, it would also get updated - meaning financial records
+// could be silently overwritten by a direct API call. Now only the fields the Edit Form
+// actually sends (name, phone, address) are allow-listed, and only those are sent to the DB.
 router.put("/update/:id", async (req, res) => {
   try {
     const { name, phone, address } = req.body;
@@ -104,55 +105,55 @@ router.put("/update/:id", async (req, res) => {
     });
 
     if (!updatedSupplier) {
-      return res.status(404).json({ message: "සැපයුම්කරු සොයාගත නොහැක" });
+      return res.status(404).json({ message: "Supplier not found" });
     }
 
-    res.json({ message: "විස්තර යාවත්කාලීන කිරීම සාර්ථකයි! 🔄", supplier: updatedSupplier });
+    res.json({ message: "Details updated successfully! 🔄", supplier: updatedSupplier });
   } catch (error) {
-    console.error("යාවත්කාලීන කිරීම අසාර්ථකයි", error);
-    res.status(500).json({ message: "යාවත්කාලීන කිරීම අසාර්ථකයි" });
+    console.error("Failed to update", error);
+    res.status(500).json({ message: "Failed to update" });
   }
 });
 
-// 5. Supplier කෙනෙක් මකා දැමීම
+// 5. Delete a Supplier
 router.delete("/delete/:id", async (req, res) => {
   try {
     const deletedSupplier = await Supplier.findByIdAndDelete(req.params.id);
     if (!deletedSupplier) {
-      return res.status(404).json({ message: "සැපයුම්කරු සොයාගත නොහැක" });
+      return res.status(404).json({ message: "Supplier not found" });
     }
-    res.json({ message: "මකා දැමීම සාර්ථකයි! 🗑️" });
+    res.json({ message: "Deleted successfully! 🗑️" });
   } catch (error) {
-    console.error("මකා දැමීම අසාර්ථකයි", error);
-    res.status(500).json({ message: "මකා දැමීම අසාර්ථකයි" });
+    console.error("Failed to delete", error);
+    res.status(500).json({ message: "Failed to delete" });
   }
 });
 
-// 6. 🆕 PROFESSIONAL GRN REBUILD: Supplier Invoice එකකින් Products කිහිපයක් එකවර ලැබුණු බව සටහන් කිරීම
+// 6. 🆕 PROFESSIONAL GRN REBUILD: Recording that multiple Products were received at once from a single Supplier Invoice
 // items: [{ productId, orderedQty, receivedQty, costPrice, expiryDate, stockMode }, ...]
 //
-// 🐛 FIX (core bug this rebuild solves): කලින් මෙතන product.stock විතරක් update කලා, batches[] array එක
-// කවදාවත් update කලේ නෑ. Frontend එකේ getTotalStock() batches තියෙනවා නම් batches[].stock එකතුවයි
-// return කරන්නේ product.stock එක බලන්නේම නෑ - ඒ නිසා GRN එකෙන් ලැබුණු stock එක catalog/dashboard/checkout
-// කොහේවත් පේන්නේ නැතුව "අතුරුදහන්" වුනා. දැන් "add" mode එකේදී අලුත් Batch එකක් හදලා, ඒකේම Cost Price
-// සහ Expiry Date එකත් සටහන් කරලා, product.stock එකත් batches[].stock එකත් එකවර atomic විදිහට $inc කරනවා -
-// checkout/void/return routes වල already පාවිච්චි කරන dual-field pattern එකමයි.
+// 🐛 FIX (core bug this rebuild solves): Previously only product.stock was updated here, and the batches[] array
+// was never updated. When batches exist, the Frontend getTotalStock() returns the sum of batches[].stock
+// and does not look at product.stock at all - so the stock received via GRN "disappeared" and was not visible anywhere in the
+// catalog/dashboard/checkout. Now in "add" mode, a new Batch is created, its own Cost Price
+// and Expiry Date are recorded, and both product.stock and batches[].stock are atomically $inc'd together -
+// the same dual-field pattern already used by the checkout/void/return routes.
 router.post("/record-purchase/:id", async (req, res) => {
   const { items, description, supplierInvoiceRef, receivedBy } = req.body;
 
   if (!Array.isArray(items) || items.length === 0) {
-    return res.status(400).json({ message: "අවම වශයෙන් භාණ්ඩයක් හෝ GRN List එකට එකතු කරන්න!" });
+    return res.status(400).json({ message: "Please add at least one item to the GRN List!" });
   }
 
-  // 🔐 TRANSACTIONS: GRN document එක, Product batches[] update එක, Supplier ledger entry එක -
-  // මේ හැම දේම එකවර සාර්ථක වෙන්න ඕන, එකක් fail උනොත් කිසිවක් save වෙන්නේ නෑ (all-or-nothing).
+  // 🔐 TRANSACTIONS: The GRN document, the Product batches[] update, and the Supplier ledger entry -
+  // all of these must succeed together; if one fails, nothing is saved (all-or-nothing).
   const session = await mongoose.startSession();
   let responsePayload = null;
 
   try {
     await session.withTransaction(async () => {
       const supplier = await Supplier.findById(req.params.id).session(session);
-      if (!supplier) throw new RouteError(404, "සැපයුම්කරු සොයාගත නොහැක");
+      if (!supplier) throw new RouteError(404, "Supplier not found");
 
       const grnNo = await generateGrnNo(session);
 
@@ -162,7 +163,7 @@ router.post("/record-purchase/:id", async (req, res) => {
       const ledgerItems = []; // backward-compatible Supplier.ledger items (legacy shape, used by existing ledger modal)
       const grnItems = []; // full new GRN.items (richer shape)
 
-      // සියලුම items validate + process කරයි
+      // Validates + processes all items
       for (let idx = 0; idx < items.length; idx++) {
         const item = items[idx];
         const receivedQty = roundQty(item.receivedQty ?? item.quantity); // 🔐 "quantity" = legacy field name, backward compat
@@ -170,18 +171,18 @@ router.post("/record-purchase/:id", async (req, res) => {
         const cost = parseFloat(item.costPrice);
 
         if (!item.productId || !receivedQty || receivedQty <= 0 || !cost || cost <= 0) {
-          throw new RouteError(400, "සියලුම භාණ්ඩ වල නිවැරදි ලැබුණු ප්‍රමාණයක් සහ මිලක් තිබිය යුතුයි!");
+          throw new RouteError(400, "All items must have a valid received quantity and price!");
         }
 
         const product = await Product.findById(item.productId).session(session);
         if (!product) {
-          throw new RouteError(404, "එක් භාණ්ඩයක් සොයාගත නොහැක - GRN List එක නැවත පරීක්ෂා කරන්න");
+          throw new RouteError(404, "An item was not found - please recheck the GRN List");
         }
 
         const expiryDate = item.expiryDate ? new Date(item.expiryDate) : null;
         const stockMode = item.stockMode === "set" ? "set" : "add";
 
-        // 🆕 Discrepancy check: Ordered Qty සටහන් කරලා තියෙනවා නම්, Received Qty එකට සමාන නැත්නම් flag කරයි
+        // 🆕 Discrepancy check: If an Ordered Qty is recorded, flags it when it does not equal the Received Qty
         const lineHasDiscrepancy = orderedQty > 0 && orderedQty !== receivedQty;
         if (lineHasDiscrepancy) {
           overallHasDiscrepancy = true;
@@ -191,12 +192,12 @@ router.post("/record-purchase/:id", async (req, res) => {
         let newBatchId = "";
 
         if (stockMode === "set") {
-          // 🛠️ "Replace/Set" = Opening Stock හෝ Correction සඳහා පමණි - batches කිහිපයක් තියෙනවා නම්
-          // කුමන batch එක replace කරන්නද කියන අපැහැදිලි බව නිසා, batch 0 හෝ 1ක් ඇති products වලට විතරක් ඉඩ දෙයි.
+          // 🛠️ "Replace/Set" = for Opening Stock or Correction only - because of the ambiguity over
+          // which batch to replace when there are multiple batches, it is allowed only for products with 0 or 1 batch.
           if (Array.isArray(product.batches) && product.batches.length > 1) {
             throw new RouteError(
               400,
-              `"${product.name}" භාණ්ඩයට Batch කිහිපයක් දැනටමත් තිබෙන නිසා "Replace" mode පාවිච්චි කරන්න බෑ - Stock Management එකෙන් එක් එක් Batch එක සකසන්න.`
+              `"Replace" mode cannot be used for "${product.name}" because it already has multiple Batches - adjust each Batch individually from Stock Management.`
             );
           }
 
@@ -210,8 +211,8 @@ router.post("/record-purchase/:id", async (req, res) => {
           product.costPrice = cost;
           await product.save({ session });
         } else {
-          // 🆕 "Add" (සාමාන්‍ය GRN) = අලුත් Batch එකක් හදලා, ඒකේම Cost Price + Expiry Date සටහන් කරයි -
-          // පරණ batch එකේ cost price එක සමග මිශ්‍ර නොවී, batch එකින් එක නිවැරදි ලාභ ගණනය සඳහා වෙන්ව තියෙනවා.
+          // 🆕 "Add" (normal GRN) = creates a new Batch and records its own Cost Price + Expiry Date -
+          // without mixing with the cost price of the old batch, it is kept separate batch by batch for accurate profit calculation.
           newBatchId = `${grnNo}-${idx + 1}`;
           const updated = await Product.findOneAndUpdate(
             { _id: item.productId },
@@ -234,7 +235,7 @@ router.post("/record-purchase/:id", async (req, res) => {
             { session, new: true }
           );
           if (!updated) {
-            throw new RouteError(404, "එක් භාණ්ඩයක් සොයාගත නොහැක - GRN List එක නැවත පරීක්ෂා කරන්න");
+            throw new RouteError(404, "An item was not found - please recheck the GRN List");
           }
         }
 
@@ -268,7 +269,7 @@ router.post("/record-purchase/:id", async (req, res) => {
 
       const status = overallHasDiscrepancy ? (anyPartial ? "Partially Received" : "Discrepancy") : "Received";
 
-      // 📄 GRN Document එක හදයි (Print/PDF + History සඳහා)
+      // 📄 Creates the GRN Document (for Print/PDF + History)
       const newGrn = new GRN({
         grnNo,
         supplierId: supplier._id,
@@ -284,8 +285,8 @@ router.post("/record-purchase/:id", async (req, res) => {
       });
       await newGrn.save({ session });
 
-      // 💰 Grand Total එක Supplier ගේ Balance Due එකට එකතු කර, Legacy Ledger Entry එකක්ද තියාගනියි
-      // (Supplier Details Modal එක දැනටමත් මේ shape එකෙන් data පෙන්වන නිසා backward-compat සඳහා)
+      // 💰 Adds the Grand Total to the Supplier's Balance Due, and also keeps a Legacy Ledger Entry
+      // (for backward-compat, since the Supplier Details Modal already displays data in this shape)
       supplier.balanceDue += grandTotal;
       supplier.ledger.push({
         type: "purchase",
@@ -298,7 +299,7 @@ router.post("/record-purchase/:id", async (req, res) => {
       await supplier.save({ session });
 
       responsePayload = {
-        message: `GRN ${grnNo} සාර්ථකව සටහන් කලා! 📦 (භාණ්ඩ ${grnItems.length}ක්, මුළු ගණන: රු.${grandTotal.toFixed(2)})`,
+        message: `GRN ${grnNo} recorded successfully! 📦 (${grnItems.length} items, Grand Total: Rs.${grandTotal.toFixed(2)})`,
         supplier,
         grn: newGrn,
       };
@@ -310,7 +311,7 @@ router.post("/record-purchase/:id", async (req, res) => {
       return res.status(error.status).json({ message: error.message });
     }
     console.error("Record-purchase error:", error);
-    res.status(500).json({ message: "සටහන් කිරීම අසාර්ථකයි" });
+    res.status(500).json({ message: "Failed to record the GRN" });
   } finally {
     await session.endSession();
   }
@@ -346,61 +347,61 @@ router.get("/grn/list", async (req, res) => {
     const grns = await GRN.find(filter).sort({ date: -1 }).limit(300);
     res.status(200).json(grns);
   } catch (error) {
-    console.error("GRN List ලබාගැනීම අසාර්ථකයි", error);
-    res.status(500).json({ message: "GRN ලැයිස්තුව ලබාගැනීම අසාර්ථකයි" });
+    console.error("Failed to fetch GRN List", error);
+    res.status(500).json({ message: "Failed to fetch the GRN list" });
   }
 });
 
-// 6.6 🆕 Single GRN (Print/PDF view සඳහා සම්පූර්ණ විස්තර)
+// 6.6 🆕 Single GRN (full details for Print/PDF view)
 router.get("/grn/:id", async (req, res) => {
   try {
     const grn = await GRN.findById(req.params.id);
-    if (!grn) return res.status(404).json({ message: "GRN එක සොයාගත නොහැක" });
+    if (!grn) return res.status(404).json({ message: "GRN not found" });
     res.status(200).json(grn);
   } catch (error) {
-    console.error("GRN ලබාගැනීම අසාර්ථකයි", error);
-    res.status(500).json({ message: "GRN එක ලබාගැනීම අසාර්ථකයි" });
+    console.error("Failed to fetch GRN", error);
+    res.status(500).json({ message: "Failed to fetch the GRN" });
   }
 });
 
-// 7. Supplier ට මුදල් ගෙවීම (Settle Payment)
-// 🐛 BUG FIX: කලින් supplier ට ගෙවන්න ඕන ප්‍රමාණයට වඩා වැඩි මුදලක් (වැරදීමකින් හෝ උදා: round-figure
-// චෙක් එකක්) ගෙව්වොත්, balanceDue 0ට clamp කලත්, ledger එකේ සම්පූර්ණ ගණනම "payment" විදිහට
-// සටහන් වුනා - ඇත්තටම ගෙවන්න ඕන ප්‍රමාණයට වඩා වැඩි ගණන (ආපසු ලැබෙන්න ඕන "change" එක) ගැන record
-// එකක්ම තිබුණේ නෑ.
-// 🆕 SHIFT RECONCILIATION: Payment Method (Cash/Card/Bank Transfer/Other) සහ මේ ගෙවීම කරපු Admin
-// කව්ද කියලා දැන් සටහන් කරයි - "Cash" ගෙවීම් විතරයි Shift Close එකේ Cash Drawer ගණනයෙන් අඩු වෙන්නේ.
-router.post("/pay/:id", async (req, res) => {
+// 7. Pay money to a Supplier (Settle Payment)
+// 🐛 BUG FIX: Previously, if more than the amount owed to the supplier was paid (by mistake or e.g. a round-figure
+// cheque), even though balanceDue was clamped to 0, the entire amount was recorded in the ledger as a "payment" -
+// there was no record at all of the amount paid over what was actually owed (the "change"
+// that should be returned).
+// 🆕 SHIFT RECONCILIATION: Now records the Payment Method (Cash/Card/Bank Transfer/Other) and which Admin
+// made this payment - only "Cash" payments are deducted from the Cash Drawer calculation at Shift Close.
+router.post("/pay/:id", requireOpenShift({ onlyIfCash: true }), async (req, res) => {
   const { amount, paymentMethod } = req.body;
   const paidAmount = Number(amount);
   const validMethods = ["Cash", "Card", "Bank Transfer", "Other"];
   const method = validMethods.includes(paymentMethod) ? paymentMethod : "Cash";
 
   if (!paidAmount || paidAmount <= 0) {
-    return res.status(400).json({ message: "නිවැරදි මුදලක් ඇතුලත් කරන්න!" });
+    return res.status(400).json({ message: "Please enter a valid amount!" });
   }
 
-  // 🔐 TRANSACTIONS: record-purchase එකේ වගේම, මේකත් session.withTransaction() එකකින් wrap කලා -
-  // concurrent writes අතරේ "lost update" race එකකින් ආරක්ෂා වෙන්න.
+  // 🔐 TRANSACTIONS: Like record-purchase, this is also wrapped in a session.withTransaction() -
+  // to protect against a "lost update" race between concurrent writes.
   const session = await mongoose.startSession();
   let responsePayload = null;
 
   try {
     await session.withTransaction(async () => {
       const supplier = await Supplier.findById(req.params.id).session(session);
-      if (!supplier) throw new RouteError(404, "සැපයුම්කරු සොයාගත නොහැක");
+      if (!supplier) throw new RouteError(404, "Supplier not found");
 
       const currentDue = supplier.balanceDue || 0;
 
-      // 🆕 FIX: ගෙවීමට ඇති මුදලක් නැති supplier කෙනෙකුට "ගෙවීමක්" record කරන්න බෑ - balanceDue
-      // 0ට වඩා තිබුනොත් විතරයි settle කරන්න ඕන දෙයක් තියෙන්නේ.
+      // 🆕 FIX: A "payment" cannot be recorded for a supplier with no amount owed - there is something to settle
+      // only if balanceDue is greater than 0.
       if (currentDue <= 0) {
-        throw new RouteError(400, "මෙම සැපයුම්කරුට ගෙවීමට ඇති මුදලක් නැත! ගෙවීමක් අවශ්‍ය නොවේ.");
+        throw new RouteError(400, "This supplier has no outstanding amount payable! No payment is required.");
       }
 
-      // balanceDue එකට ඇත්තටම යෙදෙන්නේ, ගෙවපු මුදලෙන් ණයට ඉතිරිව තියෙන ප්‍රමාණය දක්වා විතරයි
+      // Only up to the remaining credit amount of the paid amount is actually applied to balanceDue
       const appliedAmount = Math.round(Math.min(paidAmount, currentDue) * 100) / 100;
-      // ඉතුරු (ණයට වඩා ගෙවපු) මුදල - ආපසු ලැබෙන්න ඕන "change" එක
+      // The remainder (the amount paid over the credit) - the "change" that must be returned
       const changeGiven = Math.round((paidAmount - appliedAmount) * 100) / 100;
 
       supplier.balanceDue = Math.max(0, Math.round((currentDue - appliedAmount) * 100) / 100);
@@ -413,8 +414,8 @@ router.post("/pay/:id", async (req, res) => {
         cashier: req.user.username,
         paymentMethod: method,
         description: changeGiven > 0
-          ? `ගෙවීමක් සිදු කිරීම (ගෙවූ මුදල: රු.${paidAmount.toFixed(2)}, ණයට යෙදුවේ: රු.${appliedAmount.toFixed(2)}, ආපසු ලැබුණු මුදල: රු.${changeGiven.toFixed(2)}) - ${method}`
-          : `ගෙවීමක් සිදු කිරීම - ${method}`,
+          ? `Payment made (Amount paid: Rs.${paidAmount.toFixed(2)}, Applied to credit: Rs.${appliedAmount.toFixed(2)}, Change returned: Rs.${changeGiven.toFixed(2)}) - ${method}`
+          : `Payment made - ${method}`,
         date: new Date(),
       });
 
@@ -422,8 +423,8 @@ router.post("/pay/:id", async (req, res) => {
 
       responsePayload = {
         message: changeGiven > 0
-          ? `ගෙවීම සාර්ථකව සටහන් කලා! 💵 ආපසු ලැබෙන්න ඕන මුදල: රු.${changeGiven.toFixed(2)}`
-          : "ගෙවීම සාර්ථකව සටහන් කලා! 💵",
+          ? `Payment recorded successfully! 💵 Change to be returned: Rs.${changeGiven.toFixed(2)}`
+          : "Payment recorded successfully! 💵",
         supplier,
         appliedAmount,
         changeGiven
@@ -435,8 +436,8 @@ router.post("/pay/:id", async (req, res) => {
     if (error instanceof RouteError) {
       return res.status(error.status).json({ message: error.message });
     }
-    console.error("ගෙවීම අසාර්ථකයි", error);
-    res.status(500).json({ message: "ගෙවීම අසාර්ථකයි" });
+    console.error("Failed to make payment", error);
+    res.status(500).json({ message: "Failed to make payment" });
   } finally {
     await session.endSession();
   }
