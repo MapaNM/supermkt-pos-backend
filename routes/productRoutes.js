@@ -10,6 +10,7 @@ const Return = require('../models/Return');
 const Counter = require('../models/Counter');
 const Promotion = require('../models/Promotion'); // 🔐 needed to verify bill-level discounts server-side
 const { requireOpenShift } = require('../middleware/requireShift'); // 🔐 Enforce Shift requirement
+const { sumBatchStock, mergeBatchesForUpdate, effectiveExpiry, resolveSaleBatch, validateProductInput } = require('../utils/batchLogic');
 const { requireAdmin } = require('../middleware/auth'); // 🔐 note: `protect` is already applied to the whole /api/products path in server.js
 
 // 🆕 Net Revenue/Profit per bill (deducting returned quantities and accounting for Bill-level discounts) - used by both Sales Summary and
@@ -59,6 +60,9 @@ router.post("/add", requireAdmin, async (req, res) => {
   try {
     const { name, price, marketPrice, costPrice, stock, discount, barcode, unit, category, minStockLevel, preferredSupplierId, expiryDate, batches } = req.body;
 
+    const inputError = validateProductInput({ price, costPrice, marketPrice, stock, discount, batches });
+    if (inputError) return res.status(400).json({ message: inputError });
+
     const parsedPrice = parseFloat(price) || 0;
     const parsedCost = parseFloat(costPrice) || 0;
     const parsedMarket = parseFloat(marketPrice) || parsedPrice;
@@ -66,7 +70,7 @@ router.post("/add", requireAdmin, async (req, res) => {
 
     // If no Batches are sent, creates a default initial batch
     const initialBatches = (batches && Array.isArray(batches) && batches.length > 0)
-      ? batches
+      ? mergeBatchesForUpdate({ stock: parsedStock, batches: [] }, batches)
       : [{
           batchId: "B-1",
           price: parsedPrice,
@@ -81,7 +85,7 @@ router.post("/add", requireAdmin, async (req, res) => {
       price: parsedPrice,
       marketPrice: parsedMarket,
       costPrice: parsedCost,
-      stock: parsedStock,
+      stock: initialBatches.length > 0 ? sumBatchStock(initialBatches) : parsedStock, // always equals the sum of the batches
       discount: parseFloat(discount) || 0,
       barcode: barcode || "",
       unit: unit ?? "Kg", // 🛠️ FIX: so that "" (no Unit, intentional) is not forced to "Kg" - fall back only for undefined/null
@@ -117,41 +121,61 @@ router.get('/', async (req, res) => {
 // and sent, they would be updated too. Now only the fields the Edit Product Form actually sends are allow-listed,
 // and only those are passed to the DB.
 router.put("/update/:id", requireAdmin, async (req, res) => {
+  const {
+    name, marketPrice, price, costPrice, stock, discount, barcode,
+    unit, category, minStockLevel, preferredSupplierId, expiryDate, batches,
+  } = req.body;
+
+  const inputError = validateProductInput({ price, costPrice, marketPrice, stock, discount, batches });
+  if (inputError) return res.status(400).json({ message: inputError });
+
+  const session = await mongoose.startSession();
+  let updatedProduct = null;
   try {
-    const {
-      name, marketPrice, price, costPrice, stock, discount, barcode,
-      unit, category, minStockLevel, preferredSupplierId, expiryDate, batches,
-    } = req.body;
+    // 🐛 FIX (lost update): the Edit form sends back the whole batches[] it loaded earlier. If a cashier sold items while the form
+    // was open, writing that stale array back would "restore" the sold stock. Read the current product inside a transaction and merge:
+    // existing batches keep their CURRENT DB stock; a concurrent checkout makes the transaction retry instead of being overwritten.
+    await session.withTransaction(async () => {
+      const existing = await Product.findById(req.params.id).session(session);
+      if (!existing) throw new RouteError(404, "Item not found");
 
-    const updateFields = {};
-    if (name !== undefined) updateFields.name = name;
-    if (marketPrice !== undefined) updateFields.marketPrice = marketPrice;
-    if (price !== undefined) updateFields.price = price;
-    if (costPrice !== undefined) updateFields.costPrice = costPrice;
-    if (stock !== undefined) updateFields.stock = stock;
-    if (discount !== undefined) updateFields.discount = discount;
-    if (barcode !== undefined) updateFields.barcode = barcode;
-    if (unit !== undefined) updateFields.unit = unit;
-    if (category !== undefined) updateFields.category = category;
-    if (minStockLevel !== undefined) updateFields.minStockLevel = minStockLevel;
-    if (preferredSupplierId !== undefined) updateFields.preferredSupplierId = preferredSupplierId;
-    if (expiryDate !== undefined) updateFields.expiryDate = expiryDate;
-    if (batches !== undefined) updateFields.batches = batches;
+      const updateFields = {};
+      if (name !== undefined) updateFields.name = name;
+      if (marketPrice !== undefined) updateFields.marketPrice = marketPrice;
+      if (price !== undefined) updateFields.price = price;
+      if (costPrice !== undefined) updateFields.costPrice = costPrice;
+      if (discount !== undefined) updateFields.discount = discount;
+      if (barcode !== undefined) updateFields.barcode = barcode;
+      if (unit !== undefined) updateFields.unit = unit;
+      if (category !== undefined) updateFields.category = category;
+      if (minStockLevel !== undefined) updateFields.minStockLevel = minStockLevel;
+      if (preferredSupplierId !== undefined) updateFields.preferredSupplierId = preferredSupplierId;
+      if (expiryDate !== undefined) updateFields.expiryDate = expiryDate;
 
-    const updatedProduct = await Product.findByIdAndUpdate(
-      req.params.id,
-      updateFields,
-      { returnDocument: 'after', runValidators: true }
-    );
+      if (Array.isArray(batches)) {
+        const merged = mergeBatchesForUpdate(existing, batches);
+        updateFields.batches = merged;
+        // Top-level stock always mirrors the batches; with no batches the form's stock value is used (legacy product)
+        if (merged.length > 0) updateFields.stock = sumBatchStock(merged);
+        else if (stock !== undefined) updateFields.stock = stock;
+      } else if (stock !== undefined && !(existing.batches && existing.batches.length > 0)) {
+        updateFields.stock = stock; // a stock edit is only meaningful for a product without batches
+      }
 
-    if (!updatedProduct) {
-      return res.status(404).json({ message: "Item not found" });
-    }
+      updatedProduct = await Product.findByIdAndUpdate(
+        req.params.id,
+        updateFields,
+        { returnDocument: 'after', runValidators: true, session }
+      );
+    });
 
     res.json({ message: "Updated successfully! 🔄", product: updatedProduct });
   } catch (error) {
+    if (error instanceof RouteError) return res.status(error.status).json({ message: error.message });
     console.error("Update failed", error);
     res.status(500).json({ message: "Update failed" });
+  } finally {
+    await session.endSession();
   }
 });
 
@@ -174,17 +198,23 @@ router.get('/expiring', requireAdmin, async (req, res) => {
     const futureDate = new Date();
     futureDate.setDate(now.getDate() + days);
 
+    // 🐛 FIX: expiry lives on each batch too (GRN records it per batch). Use the earliest expiry among batches that still have stock,
+    // so a fresh batch is not flagged by a stale product-level date, and a near-expiry batch is not missed.
     const products = await Product.find({
-      expiryDate: { $ne: null, $lte: futureDate }
-    }).sort({ expiryDate: 1 });
-
-    const result = products.map(p => {
-      const isExpired = new Date(p.expiryDate) < now;
-      return {
-        ...p.toObject(),
-        expiryStatus: isExpired ? "expired" : "expiring"
-      };
+      $or: [
+        { expiryDate: { $ne: null, $lte: futureDate } },
+        { "batches.expiryDate": { $ne: null, $lte: futureDate } },
+      ],
     });
+
+    const result = products
+      .map((p) => {
+        const eff = effectiveExpiry(p);
+        if (!eff || eff > futureDate) return null;
+        return { ...p.toObject(), expiryDate: eff, expiryStatus: eff < now ? "expired" : "expiring" };
+      })
+      .filter(Boolean)
+      .sort((a, b) => new Date(a.expiryDate) - new Date(b.expiryDate));
 
     res.status(200).json(result);
   } catch (error) {
@@ -238,10 +268,7 @@ router.post('/checkout', requireOpenShift(), async (req, res) => {
           throw new RouteError(404, `Item "${item.name}" not found - please refresh the list and try again!`);
         }
 
-        let batch = null;
-        if (item.batchId && Array.isArray(product.batches) && product.batches.length > 0) {
-          batch = product.batches.find((b) => b.batchId === item.batchId) || null;
-        }
+        const batch = resolveSaleBatch(product, item.batchId); // 🐛 FIX: a line without batchId no longer bypasses the batches
 
         const canonicalPrice = batch ? batch.price : product.price;
         const canonicalDiscountPercent = (batch ? batch.discount : product.discount) || 0;
@@ -934,10 +961,7 @@ router.post('/exchange', requireOpenShift(), async (req, res) => {
         const product = await Product.findById(item._id).session(session);
         if (!product) throw new RouteError(404, `Item "${item.name}" not found!`);
 
-        let batch = null;
-        if (item.batchId && Array.isArray(product.batches) && product.batches.length > 0) {
-          batch = product.batches.find((b) => b.batchId === item.batchId) || null;
-        }
+        const batch = resolveSaleBatch(product, item.batchId); // 🐛 FIX: a line without batchId no longer bypasses the batches
 
         const canonicalPrice = batch ? batch.price : product.price;
         const canonical = {
