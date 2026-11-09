@@ -17,6 +17,7 @@ const grnItemSchema = new mongoose.Schema(
     receivedQty: { type: Number, required: true },
 
     costPrice: { type: Number, required: true },
+    sellingPrice: { type: Number, default: null }, // the new selling price set on this receipt (null = price unchanged)
     subtotal: { type: Number, required: true }, // receivedQty * costPrice
 
     expiryDate: { type: Date, default: null }, // 🆕 The Expiry Date of this Batch
