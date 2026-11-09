@@ -6,6 +6,7 @@ const Supplier = require("../models/Supplier");
 const Product = require("../models/Product");
 const { requireOpenShift } = require("../middleware/requireShift"); // 🔐 Make Shift mandatory (for Cash payments)
 const GRN = require("../models/GRN"); // 🆕 Professional GRN document
+const { buildLegacyBatch, parseSellingPrice } = require("../utils/batchLogic"); // 🐛 legacy loose stock -> real batch (see batchLogic.js)
 const Counter = require("../models/Counter"); // 🆕 Sequential GRN numbering (same pattern as Invoice No)
 // 🔐 note: this entire router is mounted behind `protect` + `requireAdmin` in server.js —
 // supplier management (purchases, balances, payments) is admin-only, no per-route changes needed here.
@@ -179,6 +180,11 @@ router.post("/record-purchase/:id", async (req, res) => {
           throw new RouteError(404, "An item was not found - please recheck the GRN List");
         }
 
+        // 🆕 Optional new selling price: when the purchase cost goes up, the admin can reprice the new stock here so the margin is protected.
+        const sell = parseSellingPrice(item.sellingPrice);
+        if (sell.error) throw new RouteError(400, `${product.name}: ${sell.error}`);
+        const newSellingPrice = sell.value; // null = keep the current price
+
         const expiryDate = item.expiryDate ? new Date(item.expiryDate) : null;
         const stockMode = item.stockMode === "set" ? "set" : "add";
 
@@ -204,33 +210,38 @@ router.post("/record-purchase/:id", async (req, res) => {
           if (Array.isArray(product.batches) && product.batches.length === 1) {
             product.batches[0].stock = receivedQty;
             product.batches[0].costPrice = cost;
+            if (newSellingPrice !== null) product.batches[0].price = newSellingPrice;
             if (expiryDate) product.batches[0].expiryDate = expiryDate;
             newBatchId = product.batches[0].batchId;
           }
           product.stock = receivedQty;
           product.costPrice = cost;
+          if (newSellingPrice !== null) product.price = newSellingPrice;
           await product.save({ session });
         } else {
           // 🆕 "Add" (normal GRN) = creates a new Batch and records its own Cost Price + Expiry Date -
           // without mixing with the cost price of the old batch, it is kept separate batch by batch for accurate profit calculation.
           newBatchId = `${grnNo}-${idx + 1}`;
+          const newBatch = {
+            batchId: newBatchId,
+            label: "",
+            price: newSellingPrice !== null ? newSellingPrice : product.price, // new stock sells at the new price; older batches keep their own price
+            costPrice: cost,
+            marketPrice: product.marketPrice,
+            discount: 0,
+            stock: receivedQty,
+            expiryDate: expiryDate || null,
+          };
+          // 🐛 FIX: a legacy product (loose stock, batches = []) used to show ONLY the new batch after a GRN, because once any batch
+          // exists the system sums the batches and ignores the loose stock (e.g. 10 @ Rs.280 + 20 @ Rs.300 displayed 20).
+          // The old loose stock is now converted into its own batch (with its own cost price) in the same atomic update.
+          const legacyBatch = buildLegacyBatch(product);
           const updated = await Product.findOneAndUpdate(
             { _id: item.productId },
             {
               $inc: { stock: receivedQty },
-              $push: {
-                batches: {
-                  batchId: newBatchId,
-                  label: "",
-                  price: product.price,
-                  costPrice: cost,
-                  marketPrice: product.marketPrice,
-                  discount: 0,
-                  stock: receivedQty,
-                  expiryDate: expiryDate || null,
-                },
-              },
-              $set: { costPrice: cost },
+              $push: { batches: legacyBatch ? { $each: [legacyBatch, newBatch] } : newBatch },
+              $set: newSellingPrice !== null ? { costPrice: cost, price: newSellingPrice } : { costPrice: cost },
             },
             { session, new: true }
           );
@@ -257,6 +268,7 @@ router.post("/record-purchase/:id", async (req, res) => {
           orderedQty,
           receivedQty,
           costPrice: cost,
+          sellingPrice: newSellingPrice,
           subtotal,
           expiryDate,
           batchId: newBatchId,
