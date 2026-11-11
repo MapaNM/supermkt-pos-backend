@@ -13,7 +13,7 @@ const { requireOpenShift } = require('../middleware/requireShift'); // 🔐 Enfo
 const { sumBatchStock, mergeBatchesForUpdate, effectiveExpiry, resolveSaleBatch, validateProductInput } = require('../utils/batchLogic');
 const { requireAdmin, requirePermission, requireAnyPermission } = require('../middleware/auth');
 const { hasPermission, checkReturnLimit } = require('../utils/Permissions');
-const { audit } = require('../utils/audit'); // 🔐 note: `protect` is already applied to the whole /api/products path in server.js
+const { audit } = require('../utils/Audit'); // 🔐 note: `protect` is already applied to the whole /api/products path in server.js
 
 // 🆕 Net Revenue/Profit per bill (deducting returned quantities and accounting for Bill-level discounts) - used by both Sales Summary and
 // Dashboard so they share one calculation: use this helper. Profit = Revenue − (Cost of the items that are not deducted).

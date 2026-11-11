@@ -8,7 +8,7 @@ const { requireOpenShift } = require("../middleware/requireShift"); // 🔐 Make
 const GRN = require("../models/GRN"); // 🆕 Professional GRN document
 const { buildLegacyBatch, parseSellingPrice } = require("../utils/batchLogic");
 const { requirePermission, requireAnyPermission } = require("../middleware/auth");
-const { audit } = require("../utils/audit");
+const { audit } = require("../utils/Audit");
 const ANY_SUPPLIER_ACCESS = requireAnyPermission(["manage_suppliers", "receive_stock", "pay_supplier"]); // 🐛 legacy loose stock -> real batch (see batchLogic.js)
 const Counter = require("../models/Counter"); // 🆕 Sequential GRN numbering (same pattern as Invoice No)
 // 🔐 note: this entire router is mounted behind `protect` + `requireAdmin` in server.js —

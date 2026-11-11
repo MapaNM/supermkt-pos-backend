@@ -4,7 +4,7 @@ const jwt = require('jsonwebtoken');
 const User = require('../models/User');
 const { protect, requireAdmin } = require('../middleware/auth');
 const { PERMISSIONS, PRESETS, DEFAULT_PRESET, sanitizePermissions, effectivePermissions, publicUser } = require('../utils/Permissions');
-const { audit } = require('../utils/audit');
+const { audit } = require('../utils/Audit');
 
 const generateToken = (user) => {
     return jwt.sign({ id: user._id, role: user.role }, process.env.JWT_SECRET, { expiresIn: '12h' });

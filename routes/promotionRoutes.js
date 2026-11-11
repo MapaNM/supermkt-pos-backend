@@ -2,7 +2,7 @@ const express = require("express");
 const router = express.Router();
 const Promotion = require("../models/Promotion");
 const { requirePermission } = require("../middleware/auth");
-const { audit } = require("../utils/audit"); // 🔐 note: `protect` already applied at /api/promotions in server.js
+const { audit } = require("../utils/Audit"); // 🔐 note: `protect` already applied at /api/promotions in server.js
 
 // 1. Get all Promotions (for both the Billing Screen and the Admin Panel)
 router.get("/", async (req, res) => {

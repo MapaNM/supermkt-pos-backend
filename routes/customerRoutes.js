@@ -5,7 +5,7 @@ const RouteError = require('../utils/RouteError');
 const Customer = require('../models/Customer');
 const { requireOpenShift } = require('../middleware/requireShift'); // 🔐 Make Shift mandatory (for Cash payments)
 const { requireAdmin, requirePermission } = require('../middleware/auth');
-const { audit } = require('../utils/audit'); // 🔐 note: `protect` already applied at /api/customers in server.js
+const { audit } = require('../utils/Audit'); // 🔐 note: `protect` already applied at /api/customers in server.js
 
 // 1. Add a new customer
 router.post('/add', async (req, res) => {
