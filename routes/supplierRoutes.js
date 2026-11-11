@@ -6,7 +6,10 @@ const Supplier = require("../models/Supplier");
 const Product = require("../models/Product");
 const { requireOpenShift } = require("../middleware/requireShift"); // 🔐 Make Shift mandatory (for Cash payments)
 const GRN = require("../models/GRN"); // 🆕 Professional GRN document
-const { buildLegacyBatch, parseSellingPrice } = require("../utils/batchLogic"); // 🐛 legacy loose stock -> real batch (see batchLogic.js)
+const { buildLegacyBatch, parseSellingPrice } = require("../utils/batchLogic");
+const { requirePermission, requireAnyPermission } = require("../middleware/auth");
+const { audit } = require("../utils/audit");
+const ANY_SUPPLIER_ACCESS = requireAnyPermission(["manage_suppliers", "receive_stock", "pay_supplier"]); // 🐛 legacy loose stock -> real batch (see batchLogic.js)
 const Counter = require("../models/Counter"); // 🆕 Sequential GRN numbering (same pattern as Invoice No)
 // 🔐 note: this entire router is mounted behind `protect` + `requireAdmin` in server.js —
 // supplier management (purchases, balances, payments) is admin-only, no per-route changes needed here.
@@ -36,7 +39,7 @@ async function generateGrnNo(session = null) {
 }
 
 // 1. Add a new Supplier
-router.post("/add", async (req, res) => {
+router.post("/add", requirePermission("manage_suppliers"), async (req, res) => {
   try {
     const { name, phone, address } = req.body;
 
@@ -47,6 +50,7 @@ router.post("/add", async (req, res) => {
 
     const newSupplier = new Supplier({ name, phone, address });
     await newSupplier.save();
+    audit(req, { action: "supplier_added", category: "suppliers", summary: `Added supplier "${newSupplier.name}"`, targetType: "Supplier", targetId: newSupplier._id });
     res.status(201).json({ message: "Supplier added successfully! 🚚", supplier: newSupplier });
   } catch (error) {
     console.error("Failed to add supplier", error);
@@ -55,7 +59,7 @@ router.post("/add", async (req, res) => {
 });
 
 // 2. Get all Suppliers
-router.get("/", async (req, res) => {
+router.get("/", ANY_SUPPLIER_ACCESS, async (req, res) => {
   try {
     const suppliers = await Supplier.find().sort({ name: 1 });
     res.status(200).json(suppliers);
@@ -66,7 +70,7 @@ router.get("/", async (req, res) => {
 });
 
 // 3. Search for a Supplier by name or phone number (Live Search)
-router.get("/search/:query", async (req, res) => {
+router.get("/search/:query", ANY_SUPPLIER_ACCESS, async (req, res) => {
   try {
     const { query } = req.params;
     if (!query || query.trim().length === 0) return res.json([]);
@@ -92,7 +96,7 @@ router.get("/search/:query", async (req, res) => {
 // balanceDue, ledger) was added to the request body, it would also get updated - meaning financial records
 // could be silently overwritten by a direct API call. Now only the fields the Edit Form
 // actually sends (name, phone, address) are allow-listed, and only those are sent to the DB.
-router.put("/update/:id", async (req, res) => {
+router.put("/update/:id", requirePermission("manage_suppliers"), async (req, res) => {
   try {
     const { name, phone, address } = req.body;
     const updateFields = {};
@@ -109,6 +113,7 @@ router.put("/update/:id", async (req, res) => {
       return res.status(404).json({ message: "Supplier not found" });
     }
 
+    audit(req, { action: "supplier_updated", category: "suppliers", summary: `Edited supplier "${updatedSupplier.name}"`, targetType: "Supplier", targetId: updatedSupplier._id });
     res.json({ message: "Details updated successfully! 🔄", supplier: updatedSupplier });
   } catch (error) {
     console.error("Failed to update", error);
@@ -117,12 +122,13 @@ router.put("/update/:id", async (req, res) => {
 });
 
 // 5. Delete a Supplier
-router.delete("/delete/:id", async (req, res) => {
+router.delete("/delete/:id", requirePermission("manage_suppliers"), async (req, res) => {
   try {
     const deletedSupplier = await Supplier.findByIdAndDelete(req.params.id);
     if (!deletedSupplier) {
       return res.status(404).json({ message: "Supplier not found" });
     }
+    audit(req, { action: "supplier_deleted", category: "suppliers", severity: "critical", summary: `Deleted supplier "${deletedSupplier.name}" (balance due was Rs.${(deletedSupplier.balanceDue || 0).toFixed(2)})`, targetType: "Supplier", targetId: deletedSupplier._id });
     res.json({ message: "Deleted successfully! 🗑️" });
   } catch (error) {
     console.error("Failed to delete", error);
@@ -139,7 +145,7 @@ router.delete("/delete/:id", async (req, res) => {
 // catalog/dashboard/checkout. Now in "add" mode, a new Batch is created, its own Cost Price
 // and Expiry Date are recorded, and both product.stock and batches[].stock are atomically $inc'd together -
 // the same dual-field pattern already used by the checkout/void/return routes.
-router.post("/record-purchase/:id", async (req, res) => {
+router.post("/record-purchase/:id", requirePermission("receive_stock"), async (req, res) => {
   const { items, description, supplierInvoiceRef, receivedBy } = req.body;
 
   if (!Array.isArray(items) || items.length === 0) {
@@ -317,6 +323,7 @@ router.post("/record-purchase/:id", async (req, res) => {
       };
     });
 
+    audit(req, { action: "grn_recorded", category: "suppliers", severity: "warning", summary: `GRN ${responsePayload.grn.grnNo} recorded for "${responsePayload.supplier.name}" - Rs.${(responsePayload.grn.grandTotal ?? 0).toFixed ? Number(responsePayload.grn.grandTotal).toFixed(2) : responsePayload.grn.grandTotal}`, targetType: "GRN", targetId: responsePayload.grn._id });
     res.status(200).json(responsePayload);
   } catch (error) {
     if (error instanceof RouteError) {
@@ -330,7 +337,7 @@ router.post("/record-purchase/:id", async (req, res) => {
 });
 
 // 6.5 🆕 GRN List (History) - Filter: supplierId, from, to, q (GRN No / Supplier Name search)
-router.get("/grn/list", async (req, res) => {
+router.get("/grn/list", requirePermission("receive_stock"), async (req, res) => {
   try {
     const { supplierId, from, to, q } = req.query;
     const filter = {};
@@ -365,7 +372,7 @@ router.get("/grn/list", async (req, res) => {
 });
 
 // 6.6 🆕 Single GRN (full details for Print/PDF view)
-router.get("/grn/:id", async (req, res) => {
+router.get("/grn/:id", requirePermission("receive_stock"), async (req, res) => {
   try {
     const grn = await GRN.findById(req.params.id);
     if (!grn) return res.status(404).json({ message: "GRN not found" });
@@ -383,7 +390,7 @@ router.get("/grn/:id", async (req, res) => {
 // that should be returned).
 // 🆕 SHIFT RECONCILIATION: Now records the Payment Method (Cash/Card/Bank Transfer/Other) and which Admin
 // made this payment - only "Cash" payments are deducted from the Cash Drawer calculation at Shift Close.
-router.post("/pay/:id", requireOpenShift({ onlyIfCash: true }), async (req, res) => {
+router.post("/pay/:id", requirePermission("pay_supplier"), requireOpenShift({ onlyIfCash: true }), async (req, res) => {
   const { amount, paymentMethod } = req.body;
   const paidAmount = Number(amount);
   const validMethods = ["Cash", "Card", "Bank Transfer", "Other"];
@@ -443,6 +450,7 @@ router.post("/pay/:id", requireOpenShift({ onlyIfCash: true }), async (req, res)
       };
     });
 
+    audit(req, { action: "supplier_payment", category: "suppliers", severity: "warning", summary: `Paid supplier "${responsePayload.supplier.name}" Rs.${responsePayload.appliedAmount.toFixed(2)}`, targetType: "Supplier", targetId: req.params.id });
     res.status(200).json(responsePayload);
   } catch (error) {
     if (error instanceof RouteError) {

@@ -4,7 +4,8 @@ const router = express.Router();
 const RouteError = require('../utils/RouteError');
 const Customer = require('../models/Customer');
 const { requireOpenShift } = require('../middleware/requireShift'); // 🔐 Make Shift mandatory (for Cash payments)
-const { requireAdmin } = require('../middleware/auth'); // 🔐 note: `protect` already applied at /api/customers in server.js
+const { requireAdmin, requirePermission } = require('../middleware/auth');
+const { audit } = require('../utils/audit'); // 🔐 note: `protect` already applied at /api/customers in server.js
 
 // 1. Add a new customer
 router.post('/add', async (req, res) => {
@@ -28,7 +29,7 @@ router.post('/add', async (req, res) => {
 // even if the Edit Form only sends name/phone, if an extra field (e.g. creditBalance,
 // creditHistory) was added to the request body, it would also get updated. Now only the fields the Edit Form
 // actually sends (name, phone) are allow-listed, and only those are sent to the DB.
-router.put("/update/:id", requireAdmin, async (req, res) => {
+router.put("/update/:id", requirePermission("manage_customers"), async (req, res) => {
   try {
     const { name, phone } = req.body;
     const updateFields = {};
@@ -45,6 +46,7 @@ router.put("/update/:id", requireAdmin, async (req, res) => {
       return res.status(404).json({ message: "Customer not found" });
     }
 
+    audit(req, { action: "customer_updated", category: "customers", summary: `Edited customer "${updatedCustomer.name}" (${updatedCustomer.phone})`, targetType: "Customer", targetId: updatedCustomer._id });
     res.json({ message: "Details updated successfully! 🔄", customer: updatedCustomer });
   } catch (error) {
     console.error("Failed to update", error);
@@ -95,7 +97,7 @@ router.get("/search/:query", async (req, res) => {
 });
 
 // 🛠️ UPDATED: Route to delete a customer
-router.delete("/delete/:id", requireAdmin, async (req, res) => {
+router.delete("/delete/:id", requirePermission("manage_customers"), async (req, res) => {
   try {
     const deletedCustomer = await Customer.findByIdAndDelete(req.params.id);
 
@@ -103,6 +105,7 @@ router.delete("/delete/:id", requireAdmin, async (req, res) => {
       return res.status(404).json({ message: "Customer not found" });
     }
 
+    audit(req, { action: "customer_deleted", category: "customers", severity: "critical", summary: `Deleted customer "${deletedCustomer.name}" (credit balance was Rs.${(deletedCustomer.creditBalance || 0).toFixed(2)})`, targetType: "Customer", targetId: deletedCustomer._id });
     res.json({ message: "Deleted successfully! 🗑️" });
   } catch (error) {
     console.error("Failed to delete", error);
@@ -123,7 +126,7 @@ router.delete("/delete/:id", requireAdmin, async (req, res) => {
 // wrapped in a Transaction (to protect against lost-update races between concurrent payments).
 // The Payment Method/Cashier tracking added for Shift Reconciliation is also brought
 // into this same single entry - those fields have now been added to the Customer.js schema as well.
-router.post('/pay-credit/:id', requireOpenShift({ onlyIfCash: true }), async (req, res) => {
+router.post('/pay-credit/:id', requirePermission('collect_credit_payment'), requireOpenShift({ onlyIfCash: true }), async (req, res) => {
     const { amount, paymentMethod } = req.body;
     const paidAmount = Number(amount);
     if (!paidAmount || paidAmount <= 0) {
@@ -145,7 +148,7 @@ router.post('/pay-credit/:id', requireOpenShift({ onlyIfCash: true }), async (re
             // 🆕 FIX: A "payment" cannot be recorded for a customer with no credit - just like balanceDue,
             // there is something to settle only if creditBalance is greater than 0.
             if (owedBefore <= 0) {
-                throw new routeError(400, "This customer has no outstanding credit to pay! No payment is required.");
+                throw new RouteError(400, "This customer has no outstanding credit to pay! No payment is required.");
             }
 
             // Only up to the remaining credit amount of the paid amount is actually applied to creditBalance
@@ -182,6 +185,7 @@ router.post('/pay-credit/:id', requireOpenShift({ onlyIfCash: true }), async (re
             };
         });
 
+        audit(req, { action: "credit_payment", category: "customers", summary: `Credit payment Rs.${responsePayload.appliedAmount.toFixed(2)} from "${responsePayload.customer.name}" (${method})`, targetType: "Customer", targetId: req.params.id, details: { changeGiven: responsePayload.changeGiven } });
         res.status(200).json(responsePayload);
     } catch (error) {
         if (error instanceof RouteError) {

@@ -11,7 +11,9 @@ const Counter = require('../models/Counter');
 const Promotion = require('../models/Promotion'); // 🔐 needed to verify bill-level discounts server-side
 const { requireOpenShift } = require('../middleware/requireShift'); // 🔐 Enforce Shift requirement
 const { sumBatchStock, mergeBatchesForUpdate, effectiveExpiry, resolveSaleBatch, validateProductInput } = require('../utils/batchLogic');
-const { requireAdmin } = require('../middleware/auth'); // 🔐 note: `protect` is already applied to the whole /api/products path in server.js
+const { requireAdmin, requirePermission, requireAnyPermission } = require('../middleware/auth');
+const { hasPermission, checkReturnLimit } = require('../utils/permissions');
+const { audit } = require('../utils/audit'); // 🔐 note: `protect` is already applied to the whole /api/products path in server.js
 
 // 🆕 Net Revenue/Profit per bill (deducting returned quantities and accounting for Bill-level discounts) - used by both Sales Summary and
 // Dashboard so they share one calculation: use this helper. Profit = Revenue − (Cost of the items that are not deducted).
@@ -56,7 +58,7 @@ async function generateInvoiceNo(session = null) {
 }
 
 // 1. Add an item (with a Default Batch)
-router.post("/add", requireAdmin, async (req, res) => {
+router.post("/add", requirePermission("manage_products"), async (req, res) => {
   try {
     const { name, price, marketPrice, costPrice, stock, discount, barcode, unit, category, minStockLevel, preferredSupplierId, expiryDate, batches } = req.body;
 
@@ -97,6 +99,7 @@ router.post("/add", requireAdmin, async (req, res) => {
     });
 
     await newProduct.save();
+    audit(req, { action: "product_added", category: "stock", summary: `Added item "${newProduct.name}" (price Rs.${newProduct.price}, stock ${newProduct.stock})`, targetType: "Product", targetId: newProduct._id });
     res.status(201).json({ message: "Item added successfully! ✅", product: newProduct });
   } catch (error) {
     console.error("Failed to add item", error);
@@ -108,6 +111,15 @@ router.post("/add", requireAdmin, async (req, res) => {
 router.get('/', async (req, res) => {
   try {
     const products = await Product.find();
+    // 🔐 Cost prices never leave the server for users without "view_cost_price" (hiding them in the UI alone is not enough)
+    if (!hasPermission(req.user, "view_cost_price")) {
+      return res.status(200).json(products.map((p) => {
+        const o = p.toObject();
+        delete o.costPrice;
+        if (Array.isArray(o.batches)) o.batches = o.batches.map(({ costPrice, ...rest }) => rest);
+        return o;
+      }));
+    }
     res.status(200).json(products);
   } catch (error) {
     console.error("Failed to fetch data", error);
@@ -120,7 +132,7 @@ router.get('/', async (req, res) => {
 // Vulnerability) - if extra fields not sent by the Edit Form were added to the request body
 // and sent, they would be updated too. Now only the fields the Edit Product Form actually sends are allow-listed,
 // and only those are passed to the DB.
-router.put("/update/:id", requireAdmin, async (req, res) => {
+router.put("/update/:id", requirePermission("manage_products"), async (req, res) => {
   const {
     name, marketPrice, price, costPrice, stock, discount, barcode,
     unit, category, minStockLevel, preferredSupplierId, expiryDate, batches,
@@ -131,6 +143,7 @@ router.put("/update/:id", requireAdmin, async (req, res) => {
 
   const session = await mongoose.startSession();
   let updatedProduct = null;
+  let beforeSnap = null;
   try {
     // 🐛 FIX (lost update): the Edit form sends back the whole batches[] it loaded earlier. If a cashier sold items while the form
     // was open, writing that stale array back would "restore" the sold stock. Read the current product inside a transaction and merge:
@@ -138,12 +151,14 @@ router.put("/update/:id", requireAdmin, async (req, res) => {
     await session.withTransaction(async () => {
       const existing = await Product.findById(req.params.id).session(session);
       if (!existing) throw new RouteError(404, "Item not found");
+      beforeSnap = { name: existing.name, price: existing.price, costPrice: existing.costPrice, stock: existing.stock };
 
       const updateFields = {};
       if (name !== undefined) updateFields.name = name;
       if (marketPrice !== undefined) updateFields.marketPrice = marketPrice;
       if (price !== undefined) updateFields.price = price;
-      if (costPrice !== undefined) updateFields.costPrice = costPrice;
+      const canSeeCost = hasPermission(req.user, "view_cost_price"); // a user who cannot see costs must never overwrite them (the form would send blanks)
+      if (costPrice !== undefined && canSeeCost) updateFields.costPrice = costPrice;
       if (discount !== undefined) updateFields.discount = discount;
       if (barcode !== undefined) updateFields.barcode = barcode;
       if (unit !== undefined) updateFields.unit = unit;
@@ -154,6 +169,10 @@ router.put("/update/:id", requireAdmin, async (req, res) => {
 
       if (Array.isArray(batches)) {
         const merged = mergeBatchesForUpdate(existing, batches);
+        if (!canSeeCost) {
+          const oldCost = new Map((existing.batches || []).map((b) => [b.batchId, b.costPrice]));
+          merged.forEach((b) => { b.costPrice = oldCost.has(b.batchId) ? oldCost.get(b.batchId) : (existing.costPrice || 0); });
+        }
         updateFields.batches = merged;
         // Top-level stock always mirrors the batches; with no batches the form's stock value is used (legacy product)
         if (merged.length > 0) updateFields.stock = sumBatchStock(merged);
@@ -169,6 +188,17 @@ router.put("/update/:id", requireAdmin, async (req, res) => {
       );
     });
 
+    if (beforeSnap && updatedProduct) {
+      const changes = [];
+      if (beforeSnap.price !== updatedProduct.price) changes.push(`price Rs.${beforeSnap.price} -> Rs.${updatedProduct.price}`);
+      if (beforeSnap.costPrice !== updatedProduct.costPrice) changes.push(`cost Rs.${beforeSnap.costPrice} -> Rs.${updatedProduct.costPrice}`);
+      if (beforeSnap.stock !== updatedProduct.stock) changes.push(`stock ${beforeSnap.stock} -> ${updatedProduct.stock}`);
+      audit(req, {
+        action: "product_updated", category: "stock", severity: changes.some((c) => c.startsWith("price") || c.startsWith("cost")) ? "warning" : "info",
+        summary: `Edited item "${updatedProduct.name}"${changes.length ? " - " + changes.join("; ") : ""}`,
+        targetType: "Product", targetId: updatedProduct._id, details: { before: beforeSnap },
+      });
+    }
     res.json({ message: "Updated successfully! 🔄", product: updatedProduct });
   } catch (error) {
     if (error instanceof RouteError) return res.status(error.status).json({ message: error.message });
@@ -180,9 +210,10 @@ router.put("/update/:id", requireAdmin, async (req, res) => {
 });
 
 // 4. Delete an item
-router.delete('/delete/:id', requireAdmin, async (req, res) => {
+router.delete('/delete/:id', requirePermission('manage_products'), async (req, res) => {
   try {
-    await Product.findByIdAndDelete(req.params.id);
+    const deletedProduct = await Product.findByIdAndDelete(req.params.id);
+    if (deletedProduct) audit(req, { action: "product_deleted", category: "stock", severity: "critical", summary: `Deleted item "${deletedProduct.name}" (stock was ${deletedProduct.stock})`, targetType: "Product", targetId: deletedProduct._id });
     res.status(200).json({ message: "Item deleted successfully! 🗑️" });
   } catch (error) {
     console.error("Delete failed", error);
@@ -191,7 +222,7 @@ router.delete('/delete/:id', requireAdmin, async (req, res) => {
 });
 
 // 4.5 EXPIRING / EXPIRED PRODUCTS LIST
-router.get('/expiring', requireAdmin, async (req, res) => {
+router.get('/expiring', requirePermission('view_stock_alerts'), async (req, res) => {
   try {
     const days = parseInt(req.query.days) || 7;
     const now = new Date();
@@ -461,7 +492,7 @@ router.post('/checkout', requireOpenShift(), async (req, res) => {
 
 // 6.1 🆕 SMART DASHBOARD (Admin) - ?days=7|14|30 (default 14). Today/yesterday, selected period vs the previous equivalent period,
 // daily, by hour, payment methods, Top Products, Cashier Performance, credit/payables (Void bills are excluded from Revenue).
-router.get('/dashboard', requireAdmin, async (req, res) => {
+router.get('/dashboard', requirePermission('view_dashboard'), async (req, res) => {
   try {
     const days = [7, 14, 30].includes(parseInt(req.query.days, 10)) ? parseInt(req.query.days, 10) : 14;
     const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
@@ -590,7 +621,7 @@ router.get('/dashboard', requireAdmin, async (req, res) => {
 });
 
 // 6. DASHBOARD SUMMARY
-router.get('/sales-summary', requireAdmin, async (req, res) => {
+router.get('/sales-summary', requirePermission('view_reports'), async (req, res) => {
   try {
     const sales = await Sale.find().sort({ createdAt: -1 });
     let totalRevenue = 0;
@@ -680,6 +711,7 @@ router.get('/sales-summary', requireAdmin, async (req, res) => {
 router.delete('/sales/clear-all', requireAdmin, async (req, res) => {
   try {
     const result = await Sale.deleteMany({});
+    audit(req, { action: "sales_cleared", category: "sales", severity: "critical", summary: `Cleared ALL sales history (${result.deletedCount} records)` });
     res.status(200).json({ message: `Sales history cleared completely! 🧹 (${result.deletedCount} Records)`, deletedCount: result.deletedCount });
   } catch (error) {
     console.error("Clear failed", error);
@@ -688,7 +720,7 @@ router.delete('/sales/clear-all', requireAdmin, async (req, res) => {
 });
 
 // 7. VOID SALE
-router.post('/void-sale/:id', requireAdmin, async (req, res) => {
+router.post('/void-sale/:id', requirePermission('void_bill'), async (req, res) => {
   // 🔐 TRANSACTIONS: Restoring Stock, setting the Sale status to "Voided", and adjusting Customer credit -
   // all three must succeed together. If a crash occurs midway, an inconsistent state such as "stock restored
   // but the sale still Completed" cannot arise.
@@ -729,6 +761,8 @@ router.post('/void-sale/:id', requireAdmin, async (req, res) => {
       await sale.save({ session });
     });
 
+    const voided = await Sale.findById(req.params.id).select("invoiceNo totalAmount cashierName").lean();
+    audit(req, { action: "bill_voided", category: "sales", severity: "critical", summary: `Voided bill ${voided?.invoiceNo || req.params.id} (Rs.${(voided?.totalAmount || 0).toFixed(2)}, cashier ${voided?.cashierName || "?"})`, targetType: "Sale", targetId: req.params.id });
     res.status(200).json({ message: "Bill voided successfully and stock restored! 🔄" });
   } catch (error) {
     if (error instanceof RouteError) {
@@ -754,6 +788,12 @@ router.get('/invoice/:id', async (req, res) => {
     if (!sale) {
       return res.status(404).json({ message: "This bill number was not found! ❌" });
     }
+    if (!hasPermission(req.user, "view_cost_price")) {
+      const o = sale.toObject();
+      delete o.totalProfit;
+      if (Array.isArray(o.items)) o.items = o.items.map(({ costPrice, ...rest }) => rest);
+      return res.status(200).json(o);
+    }
     res.status(200).json(sale);
   } catch (error) {
     res.status(500).json({ message: "An error occurred while searching for data!" });
@@ -761,7 +801,7 @@ router.get('/invoice/:id', async (req, res) => {
 });
 
 // 9. RETURN / REFUND
-router.post('/return', requireOpenShift(), async (req, res) => {
+router.post('/return', requirePermission('process_return'), requireOpenShift(), async (req, res) => {
   const { saleId, cashierName, refundMethod, items } = req.body;
   if (!saleId || !Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ message: "Please select at least one item to Return!" });
@@ -823,6 +863,11 @@ router.post('/return', requireOpenShift(), async (req, res) => {
       }
 
       if (totalRefundAmount <= 0) throw new RouteError(400, "No valid Return quantity found!");
+      const returnLimitError = checkReturnLimit(req.user, totalRefundAmount);
+      if (returnLimitError) {
+        audit(req, { action: "return_limit_exceeded", category: "security", severity: "warning", summary: `${req.user.username} tried a refund of Rs.${totalRefundAmount.toFixed(2)} above their limit`, targetType: "Sale", targetId: saleId });
+        throw new RouteError(403, returnLimitError);
+      }
 
       // 🆕 When refunding a CREDIT bill via Cash/Card, no more Cash/Card can be returned than the portion the
       // customer actually paid (amountPaid) - the Refund for the portion bought on credit must only be made
@@ -889,6 +934,7 @@ router.post('/return', requireOpenShift(), async (req, res) => {
       };
     });
 
+    audit(req, { action: "return_processed", category: "sales", severity: "warning", summary: `Return on bill ${saleId} - refund Rs.${responsePayload.totalRefundAmount.toFixed(2)} (${req.body.refundMethod || "Cash"})`, targetType: "Sale", targetId: saleId });
     res.status(200).json(responsePayload);
   } catch (error) {
     if (error instanceof RouteError) {
@@ -902,7 +948,7 @@ router.post('/return', requireOpenShift(), async (req, res) => {
 });
 
 // 10. EXCHANGE
-router.post('/exchange', requireOpenShift(), async (req, res) => {
+router.post('/exchange', requirePermission('process_return'), requireOpenShift(), async (req, res) => {
   const { saleId, cashierName, refundMethod, returnItems, newItems, extraPaymentMethod, extraCashReceived } = req.body;
 
   // 🔐 TRANSACTIONS: Old sale update + stock restore (returned items) + stock decrement (new
@@ -944,6 +990,12 @@ router.post('/exchange', requireOpenShift(), async (req, res) => {
 
         saleItem.returnedQty = alreadyReturned + returnQty;
         returnedItemsLog.push({ name: saleItem.name, qty: returnQty, refundAmount, reason: reqItem.reason || "Exchange" });
+      }
+
+      const exchangeLimitError = checkReturnLimit(req.user, totalRefundAmount);
+      if (exchangeLimitError) {
+        audit(req, { action: "return_limit_exceeded", category: "security", severity: "warning", summary: `${req.user.username} tried an exchange refund of Rs.${totalRefundAmount.toFixed(2)} above their limit`, targetType: "Sale", targetId: req.body.saleId });
+        throw new RouteError(403, exchangeLimitError);
       }
 
       // 🔐 PASS 1 (new items): As in the earlier checkout, the price and stock of the new items
@@ -1061,6 +1113,7 @@ router.post('/exchange', requireOpenShift(), async (req, res) => {
       };
     });
 
+    audit(req, { action: "exchange_processed", category: "sales", severity: "warning", summary: `Exchange on bill ${req.body.saleId} - returned Rs.${responsePayload.totalRefundAmount.toFixed(2)}, new items Rs.${responsePayload.newItemsTotal.toFixed(2)}`, targetType: "Sale", targetId: req.body.saleId });
     res.status(200).json(responsePayload);
   } catch (error) {
     if (error instanceof RouteError) {
@@ -1074,7 +1127,7 @@ router.post('/exchange', requireOpenShift(), async (req, res) => {
 });
 
 // 11. RETURN HISTORY
-router.get('/returns', requireAdmin, async (req, res) => {
+router.get('/returns', requirePermission('view_reports'), async (req, res) => {
   try {
     const returns = await Return.find().sort({ createdAt: -1 }).populate('customerId');
     res.status(200).json(returns);
@@ -1089,6 +1142,7 @@ router.get('/returns', requireAdmin, async (req, res) => {
 router.delete('/returns/clear-all', requireAdmin, async (req, res) => {
   try {
     const result = await Return.deleteMany({});
+    audit(req, { action: "returns_cleared", category: "sales", severity: "critical", summary: `Cleared ALL return/exchange history (${result.deletedCount} records)` });
     res.status(200).json({ message: `Return/Exchange history cleared completely! 🧹 (${result.deletedCount} Records)`, deletedCount: result.deletedCount });
   } catch (error) {
     console.error("Clear failed", error);
