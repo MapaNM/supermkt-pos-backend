@@ -3,7 +3,7 @@ const router = express.Router();
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
 const { protect, requireAdmin } = require('../middleware/auth');
-const { PERMISSIONS, PRESETS, DEFAULT_PRESET, sanitizePermissions, effectivePermissions, publicUser } = require('../utils/permissions');
+const { PERMISSIONS, PRESETS, DEFAULT_PRESET, sanitizePermissions, effectivePermissions, publicUser } = require('../utils/Permissions');
 const { audit } = require('../utils/audit');
 
 const generateToken = (user) => {

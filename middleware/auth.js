@@ -1,6 +1,6 @@
 const jwt = require("jsonwebtoken");
 const User = require("../models/User");
-const { hasPermission } = require("../utils/permissions");
+const { hasPermission } = require("../utils/Permissions");
 const { audit } = require("../utils/audit");
 
 // 🔐 protect: verifies the JWT and attaches the logged-in user (without the password) to req.user.
