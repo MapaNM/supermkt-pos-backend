@@ -54,6 +54,7 @@ const productRoutes = require('./routes/productRoutes');
 const userRoutes = require('./routes/userRoutes');
 const customerRoutes = require('./routes/customerRoutes'); // (the line that was above has been correctly included here)
 const supplierRoutes = require('./routes/supplierRoutes');
+const auditRoutes = require('./routes/AuditRoutes'); // 🧾 admin-only audit log
 const promotionRoutes = require('./routes/promotionRoutes');
 const shiftRoutes = require('./routes/shiftRoutes'); // 🆕 Shift / Cash Drawer Reconciliation
 
@@ -64,7 +65,8 @@ const shiftRoutes = require('./routes/shiftRoutes'); // 🆕 Shift / Cash Drawer
 app.use('/api/products', protect, productRoutes);
 app.use('/api/users', userRoutes); // login is public inside; register requires protect+requireAdmin inside
 app.use('/api/customers', protect, customerRoutes);
-app.use('/api/suppliers', protect, requireAdmin, supplierRoutes); // whole module: admin only
+app.use('/api/suppliers', protect, supplierRoutes); // permission checks are inside each route (manage_suppliers / receive_stock / pay_supplier)
+app.use('/api/audit', protect, requireAdmin, auditRoutes);
 app.use('/api/promotions', protect, promotionRoutes);
 // 🆕 Shift open/close/current - any logged-in user (cashier/admin) can manage their own Shift - only history is admin-only (requireAdmin inside the route itself)
 app.use('/api/shifts', protect, shiftRoutes);

@@ -7,7 +7,7 @@ const Return = require("../models/Return");
 const Customer = require("../models/Customer");
 const Supplier = require("../models/Supplier");
 const User = require("../models/User");
-const { requireAdmin } = require("../middleware/auth"); // 🔐 note: `protect` already applied at /api/shifts in server.js
+const { requireAdmin, requirePermission } = require("../middleware/auth"); // 🔐 note: `protect` already applied at /api/shifts in server.js
 
 const round2 = (num) => Math.round((parseFloat(num) || 0) * 100) / 100;
 
@@ -245,7 +245,7 @@ router.post("/close/:id", async (req, res) => {
 });
 
 // 4. 🆕 Shift History (Admin-only) - Filter: cashier, from, to
-router.get("/history", requireAdmin, async (req, res) => {
+router.get("/history", requirePermission("view_shift_history"), async (req, res) => {
   try {
     const { cashier, from, to } = req.query;
     const filter = {};
@@ -291,7 +291,7 @@ router.get("/history", requireAdmin, async (req, res) => {
 // Drawer that happened while the Cashier did not have an Open Shift (bills, Returns, credit payments, supplier payments).
 // Transactions made before Shifts were made mandatory, Offline Sync bills, and bypass attempts
 // are visible here. Filters: cashier, from, to (default: last 7 days)
-router.get("/outside-activity", requireAdmin, async (req, res) => {
+router.get("/outside-activity", requirePermission("view_shift_history"), async (req, res) => {
   try {
     const { cashier } = req.query;
     const now = new Date();

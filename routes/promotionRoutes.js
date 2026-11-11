@@ -1,7 +1,8 @@
 const express = require("express");
 const router = express.Router();
 const Promotion = require("../models/Promotion");
-const { requireAdmin } = require("../middleware/auth"); // 🔐 note: `protect` already applied at /api/promotions in server.js
+const { requirePermission } = require("../middleware/auth");
+const { audit } = require("../utils/audit"); // 🔐 note: `protect` already applied at /api/promotions in server.js
 
 // 1. Get all Promotions (for both the Billing Screen and the Admin Panel)
 router.get("/", async (req, res) => {
@@ -15,7 +16,7 @@ router.get("/", async (req, res) => {
 });
 
 // 2. Add a new Promotion
-router.post("/add", requireAdmin, async (req, res) => {
+router.post("/add", requirePermission("manage_promotions"), async (req, res) => {
   try {
     const { type, name, discountPercent } = req.body;
     if (!["occasion", "loyalty"].includes(type)) {
@@ -23,6 +24,7 @@ router.post("/add", requireAdmin, async (req, res) => {
     }
     const newPromotion = new Promotion({ type, name, discountPercent, isActive: false });
     await newPromotion.save();
+    audit(req, { action: "promotion_added", category: "promotions", summary: `Added promotion "${newPromotion.name}" (${newPromotion.discountPercent}%)`, targetType: "Promotion", targetId: newPromotion._id });
     res.status(201).json({ message: "Promotion added successfully! 🎉", promotion: newPromotion });
   } catch (error) {
     console.error("Failed to add", error);
@@ -36,7 +38,7 @@ router.post("/add", requireAdmin, async (req, res) => {
 // routes could be bypassed and multiple Promotions of the same type could be activated at once. Now only the fields
 // this Form actually sends (name, discountPercent, type) are allow-listed, and isActive
 // is controlled only by the /activate and /deactivate routes.
-router.put("/update/:id", requireAdmin, async (req, res) => {
+router.put("/update/:id", requirePermission("manage_promotions"), async (req, res) => {
   try {
     const { name, discountPercent, type } = req.body;
     const updateFields = {};
@@ -46,6 +48,7 @@ router.put("/update/:id", requireAdmin, async (req, res) => {
 
     const updated = await Promotion.findByIdAndUpdate(req.params.id, updateFields, { returnDocument: "after", runValidators: true });
     if (!updated) return res.status(404).json({ message: "Promotion not found" });
+    audit(req, { action: "promotion_updated", category: "promotions", summary: `Edited promotion "${updated.name}" (${updated.discountPercent}%)`, targetType: "Promotion", targetId: updated._id });
     res.json({ message: "Updated successfully! 🔄", promotion: updated });
   } catch (error) {
     console.error("Failed to update", error);
@@ -54,7 +57,7 @@ router.put("/update/:id", requireAdmin, async (req, res) => {
 });
 
 // 4. Activate a Promotion (all others of the same type are auto-deactivated - only one can be active at a time)
-router.put("/activate/:id", requireAdmin, async (req, res) => {
+router.put("/activate/:id", requirePermission("manage_promotions"), async (req, res) => {
   try {
     const promotion = await Promotion.findById(req.params.id);
     if (!promotion) return res.status(404).json({ message: "Promotion not found" });
@@ -65,6 +68,7 @@ router.put("/activate/:id", requireAdmin, async (req, res) => {
     promotion.isActive = true;
     await promotion.save();
 
+    audit(req, { action: "promotion_activated", category: "promotions", severity: "warning", summary: `Activated promotion "${promotion.name}" (${promotion.discountPercent}% off all bills)`, targetType: "Promotion", targetId: promotion._id });
     res.json({ message: `"${promotion.name}" Activated! ✅`, promotion });
   } catch (error) {
     console.error("Failed to Activate", error);
@@ -73,10 +77,11 @@ router.put("/activate/:id", requireAdmin, async (req, res) => {
 });
 
 // 5. Deactivate a Promotion
-router.put("/deactivate/:id", requireAdmin, async (req, res) => {
+router.put("/deactivate/:id", requirePermission("manage_promotions"), async (req, res) => {
   try {
     const promotion = await Promotion.findByIdAndUpdate(req.params.id, { isActive: false }, { returnDocument: "after" });
     if (!promotion) return res.status(404).json({ message: "Promotion not found" });
+    audit(req, { action: "promotion_deactivated", category: "promotions", summary: `Deactivated promotion "${promotion.name}"`, targetType: "Promotion", targetId: promotion._id });
     res.json({ message: `"${promotion.name}" Deactivated!`, promotion });
   } catch (error) {
     console.error("Failed to Deactivate", error);
@@ -85,9 +90,10 @@ router.put("/deactivate/:id", requireAdmin, async (req, res) => {
 });
 
 // 6. Delete a Promotion
-router.delete("/delete/:id", requireAdmin, async (req, res) => {
+router.delete("/delete/:id", requirePermission("manage_promotions"), async (req, res) => {
   try {
     await Promotion.findByIdAndDelete(req.params.id);
+    audit(req, { action: "promotion_deleted", category: "promotions", severity: "warning", summary: `Deleted promotion ${req.params.id}`, targetType: "Promotion", targetId: req.params.id });
     res.status(200).json({ message: "Promotion deleted! 🗑️" });
   } catch (error) {
     console.error("Failed to delete", error);
